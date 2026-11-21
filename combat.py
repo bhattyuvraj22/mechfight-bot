@@ -103,7 +103,7 @@ class Combat:
                 elif laser_active and clear and w['cooldown']<=0:
                     out['fire'][i]=True
             elif w['kind']=='lightning':
-                cone=math.radians(ws['cone_deg'])
+                cone=math.radians(ws['cone_deg'])/2  # conservative if server uses half-angle
                 out['fire'][i]=(dist<=ws['range'] and me['energy']>=reserve+ws['energy']
                                 and abs(angle_diff(me['aim'][0],aim_at(origin,pt)[0]))<cone
                                 and abs(angle_diff(out['aim'][0],aim_at(origin,pt)[0]))<cone
