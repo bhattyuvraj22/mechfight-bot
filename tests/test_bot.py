@@ -51,12 +51,12 @@ def enemy(x=35,y=0,hp=1400):
 
 def gun():
     return {'kind':'gun','cooldown':0,'ammo':12,'reload':0,
-            'stats':{'damage':45,'cooldown':0.24,'speed':252,'range':230,'mag':12,'reload':2.4}}
+            'stats':{'damage':45,'cooldown':0.24,'speed':252,'range':230,'mag':12}}
 
 
 def laser(charge=0):
     return {'kind':'laser','cooldown':0,'charge':charge,
-            'stats':{'charge':0.75,'range':280,'hold_s':2,'damage':315,'cooldown':1.65}}
+            'stats':{'charge':0.75,'range':280,'hold_s':2,'damage':315}}
 
 
 class GeometryTests(unittest.TestCase):

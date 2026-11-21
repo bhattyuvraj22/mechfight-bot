@@ -1,4 +1,4 @@
-"""Oval Sentinel v0.5: target-consistent engagements and bounded evasion."""
+"""Oval Sentinel v0.4: adaptive lead, laser dodging, kill chasing, sound facing."""
 import math
 import time
 from collections import deque
@@ -11,7 +11,7 @@ from tactics import Tactics, pick_upgrade
 
 
 class Bot:
-    name='Oval-Sentinel-v0.5'
+    name='Oval-Sentinel-baseline-simple'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -201,14 +201,9 @@ class Bot:
         speed=max(1,self.stat(me,'walk_speed',11.7))
         for d in obs.get('drops',[]) or []:
             p=d['pos'];dist=distance(pos,p)
-            arrival=dist/speed
-            capture=max(0, d.get('capture_s',4)-(d.get('progress',0) if d.get('holder')==self.slot else 0))
-            horizon=max(arrival,d.get('lands_in',0))+capture+2
-            if d.get('holder') not in (None,self.slot):
+            if dist>170 or d.get('lands_in',0)>dist/speed+8 or self.zone_cost(obs,p,10)>0:
                 continue
-            if dist>170 or d.get('lands_in',0)>arrival+8 or self.zone_cost(obs,p,horizon)>0:
-                continue
-            if any(distance(p,t['actor']['pos'])<60 for t in threats if t['actor']['kind']=='mech'):
+            if any(distance(p,t['actor']['pos'])<60 for t in threats[:4] if t['actor']['kind']=='mech'):
                 continue
             if self.world.ground_free(*p[:2],r+0.3,h):
                 out.append(tuple(p[:2]))
@@ -448,15 +443,11 @@ class Bot:
         me=obs['self'];pos=me['pos']
         r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
         speed=self.stat(me,'walk_speed',11.7)
-        if any(w and w['kind']=='laser' and w.get('charge',0)>0 for w in me['weapons']):
-            speed*=0.5
         accel=self.stat(me,'ground_accel',58.5)
         muzzle=self.stat(me,'muzzle_height',7)
-        opts=self.tactics.juke_options(obs,target['pos'],self.preferred_range(me,target),speed,accel,deadline=self.deadline-0.004)
+        opts=self.tactics.juke_options(obs,target['pos'],self.preferred_range(me,target),speed,accel)
         fallback=None
         for i,v in enumerate(opts[:6]):
-            if time.perf_counter()>self.deadline-0.003:
-                break
             q=(pos[0]+v[0]*7,pos[1]+v[1]*7)
             if self.zone_cost(obs,q,6)>0 or not self.world.ground_segment(pos,q,r+0.3,h):
                 if i==0:
@@ -488,7 +479,7 @@ class Bot:
         if not chargers:
             return False
         best=None
-        deadline=min(self.deadline-0.006,time.perf_counter()+0.004)
+        deadline=self.deadline-0.006
         for step in (5,8):
             for i in range(16):
                 if time.perf_counter()>deadline:
@@ -541,7 +532,6 @@ class Bot:
         self.kill_hp=self.tactics.kill_hp(me)
         threats=self.threat_list(obs)
         target=self.choose_target(obs,threats)
-        # {} explicitly means no shootable target; do not select a hidden one.
         self.tactics.evaluate(obs,target=target if target is not None else {})
         self.commit=self.tactics.committed
         hp=me['hp']/max(1,me['max_hp'])
@@ -555,8 +545,7 @@ class Bot:
         # A clearly winnable kill is finished even when we are below the heal line.
         finish=(target is not None and target['kind']=='mech'
                 and target.get('hp',1400)<0.4*target.get('max_hp',1400)
-                and me['hp']>1.2*target.get('hp',1400) and len(close)<2
-                and (self.commit or self.tactics.ready_damage(me,distance(pos,target['pos']))>=target.get('hp',1400)))
+                and me['hp']>1.2*target.get('hp',1400) and len(close)<2)
         z=obs['zone']
         travel=max(0,distance(pos,z['next_center'])-max(0,z['next_radius']-18))*1.6/max(1,self.stat(me,'walk_speed',11.7))
         urgent=(not me['in_zone'] or self.zone_cost(obs,pos,3)>0 or
@@ -587,14 +576,9 @@ class Bot:
         waypoint=self.nav.waypoint(pos,self.goal,self.stat(me,'radius',2.5),self.stat(me,'height',9),
                                    self.stat(me,'max_slope_deg',50),now)
         self.last_waypoint=waypoint
-        # Emergency cover gets its own bounded slice before ordinary steering.
-        # Only one movement policy owns the action on each tick.
-        action={'move':[0.0,0.0],'boost':False}
+        action=self.steer(obs,waypoint,threats)
+        self.juking=self.juke(obs,target,threats,action)
         self.dodging=self.laser_dodge(obs,action)
-        self.juking=False
-        if not self.dodging:
-            action=self.steer(obs,waypoint,threats)
-            self.juking=self.juke(obs,target,threats,action)
         wants_progress=(not self.juking) and (not self.dodging) and distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
         self.history.append((now,tuple(pos[:2]),float(wants_progress)))
         while self.history and now-self.history[0][0]>1.5:
