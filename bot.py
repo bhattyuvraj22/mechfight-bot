@@ -10,7 +10,7 @@ from navigation import Navigator
 
 
 class Bot:
-    name='Oval-Sentinel-v0.2.2'
+    name='Oval-Sentinel-v0.2.3'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -228,6 +228,9 @@ class Bot:
             preferred=105 if 'laser' in kinds else 85
             if 'lightning' in kinds and me['energy']>55 and distance(pos,target['pos'])<55:
                 preferred=34
+            if target['kind']=='npc' and not any(t['actor']['kind']=='mech' for t in threats):
+                # Stay inside our 60 m drone tracking cutoff and near the cube drop.
+                preferred=48
             q=self.walkable_goal((target['pos'][0]+dx*preferred,target['pos'][1]+dy*preferred),me)
             # Never pursue a preferred range into the storm.
             if self.zone_cost(obs,q,6)<3:
@@ -262,18 +265,7 @@ class Bot:
                     score+=min(10,distance(q,self.goal)*0.2)
                 candidates.append((score,q))
             if candidates:
-                best=min(candidates,key=lambda item:item[0])[1]
-                # A stationary retreat in open ground leaves the shooter an easy target.
-                if (self.mode=='ESCAPE' and self.healing and obs['t']-self.last_damage<2
-                        and distance(pos,best)<2 and target and target['kind']=='mech'):
-                    dx,dy=unit(pos[0]-target['pos'][0],pos[1]-target['pos'][1])
-                    side=1 if self.slot%2 else -1
-                    for lateral in (18*side,-18*side,0):
-                        q=(pos[0]+12*dx-lateral*dy,pos[1]+12*dy+lateral*dx)
-                        if (self.zone_cost(obs,q,5)==0 and
-                                self.world.ground_segment(pos,q,radius+0.3,height)):
-                            return q
-                return best
+                return min(candidates,key=lambda item:item[0])[1]
         return anchor
 
     def projectile_cost(self,obs,end):
@@ -370,14 +362,6 @@ class Bot:
         if not self.healing and self.mode!='HEAL':
             return True
         me=obs['self']
-        # Take a short finishing opportunity while damage already delays regeneration.
-        if (target['kind']=='mech' and obs['t']-self.last_damage<self.stat(me,'regen_delay',5)
-                and distance(me['pos'],target['pos'])<110):
-            for weapon in me['weapons']:
-                if (weapon and weapon['kind']=='gun' and weapon.get('ammo',0)>0
-                        and weapon.get('reload',0)<=0 and weapon['cooldown']<=0.1
-                        and target.get('hp',math.inf)<=0.8*weapon['stats']['damage']):
-                    return True
         # No healing can occur while storm damage keeps resetting the timer.
         # Return fire under continuing attack, but stop after breaking contact
         # so healing can actually start. Very close enemies merit self-defence.
@@ -450,8 +434,6 @@ class Bot:
                 self.failed_goals[self.cell(self.goal)]=now+5
                 self.explore_until=-1
         facing=target or (threats[0]['actor'] if threats else None)
-        if target is None and self.damage_bearing is not None and now-self.damage_bearing_at<2:
-            facing=None
         if facing is not None:
             yaw=math.atan2(facing['pos'][1]-pos[1],facing['pos'][0]-pos[0])
         else:
@@ -462,7 +444,7 @@ class Bot:
         allow_fire=self.should_fire(obs,target)
         # Shoot a nearby visible crate only when healthy and unthreatened. Never
         # use remembered crates for firing: they may already have been destroyed.
-        if self.mode=='COLLECT' and not threats and hp>0.88 and now-self.damage_bearing_at>=2:
+        if self.mode=='COLLECT' and not threats and hp>0.88:
             crates=[c for c in obs.get('crates',[]) if distance(pos,c['pos'])<65 and distance(c['pos'],self.goal)<8]
             if crates:
                 target=min(crates,key=lambda c:distance(pos,c['pos']))

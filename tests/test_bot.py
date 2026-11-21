@@ -230,33 +230,20 @@ class PolicyTests(unittest.TestCase):
         self.obs['tick']=40
         self.assertFalse(self.bot.act(self.obs)['fire'][0])
 
-    def test_wounded_ranged_escape_crosses_incoming_line(self):
-        self.obs['mechs']=[enemy(175)]
-        self.obs['self']['hp']=400
-        self.obs['zone'].update(radius=400,next_radius=300)
-        self.obs['events']=[{'type':'damaged','amount':45,'weapon':'gun','by':5,'bearing':0}]
-        a=self.bot.act(self.obs)
-        self.assertEqual(self.bot.mode,'ESCAPE')
-        self.assertLess(a['move'][0],0)
-        self.assertGreater(abs(a['move'][1]),0.4)
+    def test_isolated_drone_goal_stays_in_tracking_range(self):
+        drone=dict(enemy(55),kind='npc',hp=350)
+        self.obs['mechs']=[drone]
+        self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'FIGHT')
+        self.assertAlmostEqual(distance(self.bot.goal,drone['pos']),48)
+        self.assertGreater(self.bot.goal[0],0)
 
-    def test_low_hp_finisher_only_during_regen_delay(self):
-        self.obs['mechs']=[enemy(80,hp=30)]
-        self.obs['self'].update(hp=400,aim=aim_at([0,0,7],center(self.obs['mechs'][0])))
-        self.bot.last_damage=0
-        for t,expected in [(2,True),(6,False)]:
-            self.obs.update(t=t,tick=int(20*t))
-            self.assertEqual(self.bot.act(self.obs)['fire'][0],expected)
-
-    def test_hidden_contact_does_not_override_fresh_damage_direction(self):
-        self.bot.world=toy_world([prism(10,-10,22,10)])
-        self.bot.nav=Navigator(self.bot.world)
-        self.bot.combat=Combat(self.bot.world)
-        self.obs['mechs']=[enemy(40)]
-        self.obs['events']=[{'type':'damaged','amount':45,'weapon':'gun','by':9,'bearing':math.pi}]
-        a=self.bot.act(self.obs)
-        self.assertAlmostEqual(abs(a['aim'][0]),math.pi)
-        self.assertEqual(a['fire'],[False,False])
+    def test_drone_goal_keeps_normal_spacing_with_player_contact(self):
+        drone=dict(enemy(55),kind='npc',hp=40)
+        self.obs['mechs']=[drone,dict(enemy(90),id=9)]
+        self.bot.act(self.obs)
+        self.assertEqual(self.bot.target_id,drone['id'])
+        self.assertAlmostEqual(distance(self.bot.goal,drone['pos']),85)
 
     def test_empty_safe_area_is_explored(self):
         a=self.bot.act(self.obs)
