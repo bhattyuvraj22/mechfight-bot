@@ -1,4 +1,4 @@
-"""Oval Sentinel v0.3: ranged escape, equipment priority and guarded recovery."""
+"""Oval Sentinel v0.4: mobile ranged duels and earlier crossfire detection."""
 import math
 import time
 from collections import deque
@@ -10,7 +10,7 @@ from navigation import Navigator
 
 
 class Bot:
-    name='Oval-Sentinel-v0.3'
+    name='Oval-Sentinel-v0.4'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -33,6 +33,8 @@ class Bot:
         self.explore_goal=None
         self.explore_until=-1
         self.last_self_hp=None
+        self.sound_bearing=None
+        self.sound_until=-1
         self.damage_bearing=None
         self.damage_bearing_at=-100
         self.failed_goals={}
@@ -79,7 +81,8 @@ class Bot:
         return result
 
     def choose_target(self,obs,threats):
-        candidates=[t for t in threats if t['exposed'] and t['dist']<240]
+        reach=max((w['stats'].get('range',0) for w in obs['self']['weapons'] if w),default=0)
+        candidates=[t for t in threats if t['exposed'] and t['dist']<=reach]
         if not candidates:
             return None
         def score(t):
@@ -307,13 +310,21 @@ class Bot:
                 return loot
             dx,dy=unit(pos[0]-target['pos'][0],pos[1]-target['pos'][1])
             kinds=[w['kind'] for w in me['weapons'] if w]
-            preferred=105 if 'laser' in kinds else 85
-            if 'lightning' in kinds and me['energy']>55 and distance(pos,target['pos'])<55:
+            # Step across the shooter's aim while keeping a useful range.
+            # Approach a weak target only by a short step; do not chase a whole squad.
+            d=distance(pos,target['pos'])
+            preferred=145 if 'laser' in kinds else 125
+            if target.get('hp',1400)<220:
+                preferred=85
+            if 'lightning' in kinds and me['energy']>55 and d<55:
                 preferred=34
-            q=self.walkable_goal((target['pos'][0]+dx*preferred,target['pos'][1]+dy*preferred),me)
-            # Never pursue a preferred range into the storm.
-            if self.zone_cost(obs,q,6)<3:
-                return q
+            radial=clamp(preferred-d,-6,15)
+            side=1 if (int(obs['t']/2.7)+self.slot)%2 else -1
+            for sign in (side,-side):
+                q=(pos[0]+dx*radial-sign*dy*18,pos[1]+dy*radial+sign*dx*18)
+                if (self.zone_cost(obs,q,6)<=self.zone_cost(obs,pos,6)
+                        and self.world.ground_segment(pos,q,radius+0.3,height)):
+                    return q
             return anchor
         if self.mode=='COLLECT':
             loot=self.loot_goal(obs,threats)
@@ -491,7 +502,15 @@ class Bot:
         threats=self.threat_list(obs)
         target=self.choose_target(obs,threats)
         exposed=[t for t in threats if t['exposed']]
-        close=[t for t in exposed if t['dist']<115 and t['actor']['kind']=='mech']
+        shooters=[t for t in exposed if t['actor']['kind']=='mech'
+                  and t['dist']<=self.enemy_reach(t['actor'])]
+        # A sound gives a noisy direction, suitable for looking but not firing.
+        sounds=[s for s in obs.get('sounds',[]) if s['dist'] in ('near','mid')
+                and s['kind'] in ('gun','laser_charge','laser','lightning','mortar','boost','step')]
+        if sounds:
+            cue=min(sounds,key=lambda s:(s['dist']!='near',s['age']))
+            self.sound_bearing=cue['bearing']
+            self.sound_until=now+0.8-cue['age']
         z=obs['zone']
         travel=max(0,distance(pos,z['next_center'])-max(0,z['next_radius']-18))*1.6/max(1,self.stat(me,'walk_speed',11.7))
         urgent=(not me['in_zone'] or self.zone_cost(obs,pos,3)>0 or
@@ -507,7 +526,7 @@ class Bot:
             self.mode='CAPTURE'
         elif self.healing:
             self.mode='ESCAPE' if exposed else 'HEAL'
-        elif len(close)>=2:
+        elif len(shooters)>=2:
             self.mode='ESCAPE'
         elif self.equip_goal is not None:
             self.mode='EQUIP'
@@ -546,6 +565,8 @@ class Bot:
         else:
             # Torso-only scan; movement does not depend on the look direction.
             yaw=(now*0.9+self.slot*0.7+math.pi)%(2*math.pi)-math.pi
+            if now<self.sound_until:
+                yaw=self.sound_bearing
             if self.damage_bearing is not None and now-self.damage_bearing_at<2:
                 yaw=self.damage_bearing
         allow_fire=self.should_fire(obs,target)

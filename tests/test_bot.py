@@ -299,6 +299,34 @@ class PolicyTests(unittest.TestCase):
         self.bot.act(self.obs)
         self.assertNotEqual(self.bot.mode,'EQUIP')
 
+    def test_lone_ranged_duel_moves_across_fire(self):
+        self.obs['zone'].update(radius=400,next_radius=300)
+        self.obs['mechs']=[enemy(170)]
+        action=self.bot.act(self.obs)
+        self.assertGreater(abs(action['move'][1]),abs(action['move'][0]))
+        x,y=self.bot.goal
+        self.assertGreater(abs(y),2*abs(x))
+
+    def test_two_ranged_mechs_trigger_escape(self):
+        self.obs['mechs']=[enemy(150),dict(enemy(0,165),id=6)]
+        self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'ESCAPE')
+
+    def test_clear_laser_target_beyond_gun_range(self):
+        self.obs['self']['weapons'][1]=laser()
+        self.obs['mechs']=[enemy(260)]
+        action=self.bot.act(self.obs)
+        self.assertTrue(action['fire'][1])
+        self.assertFalse(action['fire'][0])
+
+    def test_sound_turns_torso_and_expires(self):
+        self.obs['sounds']=[{'kind':'laser_charge','dist':'near','age':0.05,'bearing':-1.4}]
+        action=self.bot.act(self.obs)
+        self.assertEqual(action['aim'][0],-1.4)
+        self.assertEqual(action['fire'],[False,False])
+        self.obs.update(t=1.0,tick=20,sounds=[])
+        self.assertNotEqual(self.bot.act(self.obs)['aim'][0],-1.4)
+
     def test_boost_recharges_before_restarting(self):
         b=self.bot;o=self.obs
         b.mode='ESCAPE';o['self']['hp']=350
