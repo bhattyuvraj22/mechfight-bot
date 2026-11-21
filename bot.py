@@ -1,4 +1,4 @@
-"""Oval Sentinel v0.3: adaptive dodging, committed fights, drone farming, drops."""
+"""Oval Sentinel v0.4: adaptive lead, laser dodging, kill chasing, sound facing."""
 import math
 import time
 from collections import deque
@@ -11,13 +11,13 @@ from tactics import Tactics, pick_upgrade
 
 
 class Bot:
-    name='Oval-Sentinel-v0.3'
+    name='Oval-Sentinel-v0.4'
 
     def __init__(self,hello):
         self.config=hello['config']
         self.world=World(hello['map']['dir'])
         self.nav=Navigator(self.world)
-        self.combat=Combat(self.world)
+        self.combat=Combat(self.world,hello.get('seed',0))
         self.slot=hello['slot']
         self.healing=False
         self.mode='COLLECT'
@@ -43,6 +43,8 @@ class Bot:
         self.commit=False
         self.kill_hp=220
         self.juking=False
+        self.dodging=False
+        self.dodge_until=-1
 
     def stat(self,me,key,default):
         return me['stats'].get(key,self.config['mech'].get(key,default))
@@ -91,10 +93,28 @@ class Bot:
             return (t['dist']*0.45+hp*0.045+(65 if e['kind']=='npc' else 0)
                     -(30 if e['id']==self.target_id else 0)
                     -(85 if hp<self.kill_hp else 0)
-                    -(40 if self.tactics.recent_attacker(e['id'],self.now) else 0))
+                    -(40 if self.tactics.recent_attacker(e['id'],self.now) else 0)
+                    -(35 if e.get('charging') else 0))
         target=min(candidates,key=score)['actor']
         self.target_id=target['id']
         return target
+
+    def chase_target(self,obs):
+        """A wounded target that slipped out of sight: hunt it down before it
+        regenerates. Every house bot that dies before us is a placement point."""
+        me=obs['self']
+        if self.target_id is None:
+            return None
+        t=next((m for m in obs['mechs'] if m['id']==self.target_id and m.get('kind')=='mech'),None)
+        if t is None:
+            return None
+        hp=t.get('hp',1400)
+        if (hp>0.45*t.get('max_hp',1400) or me['hp']<1.2*hp or me['hp']<0.35*me['max_hp']
+                or distance(me['pos'],t['pos'])>170 or self.zone_cost(obs,t['pos'],4)>0):
+            return None
+        others=sum(1 for m in obs['mechs'] if m.get('kind')=='mech' and m['id']!=t['id']
+                   and distance(m['pos'],t['pos'])<90)
+        return t if others<=1 else None
 
     def select_upgrade(self,obs):
         offer=obs.get('offer')
@@ -153,7 +173,8 @@ class Bot:
                 continue
             if kind=='pickups' and (has_secondary or item['kind'] not in ('laser','lightning')):
                 continue
-            if kind=='crates' and (near_only or me['hp']<0.9*me['max_hp'] or threats):
+            if kind=='crates' and (near_only or me['hp']<0.75*me['max_hp']
+                                   or any(t['actor']['kind']=='mech' for t in threats)):
                 continue
             dangerous=False
             for t in threats[:4]:
@@ -191,13 +212,15 @@ class Bot:
     def preferred_range(self,me,target):
         pos=me['pos']
         kinds=[w['kind'] for w in me['weapons'] if w]
-        preferred=105 if 'laser' in kinds else 85
-        if 'lightning' in kinds and me['energy']>55 and distance(pos,target['pos'])<55:
-            preferred=34
+        # Juking targets: lead error grows with flight time, so fight closer.
+        preferred=95 if 'laser' in kinds else 65
+        d=distance(pos,target['pos'])
+        # Lightning: 240 DPS, auto-aimed inside 45 m. Close in and use it.
+        if 'lightning' in kinds and me['energy']>40 and d<85:
+            preferred=30
         thp=target.get('hp',1400)
-        # Close in to finish: gun accuracy rises sharply inside ~60 m.
-        if target.get('kind')=='mech' and thp<0.3*target.get('max_hp',1400) and me['hp']>thp:
-            preferred=min(preferred,55)
+        if target.get('kind')=='mech' and thp<0.35*target.get('max_hp',1400) and me['hp']>thp:
+            preferred=min(preferred,40)
         return preferred
 
     def explore(self,obs,threats):
@@ -267,6 +290,10 @@ class Bot:
             if self.zone_cost(obs,q,6)<3:
                 return q
             return anchor
+        if self.mode=='CHASE' and target:
+            v=target.get('vel',[0,0,0])
+            q=(target['pos'][0]+v[0]*1.0,target['pos'][1]+v[1]*1.0)
+            return self.walkable_goal(q,me)
         if self.mode=='COLLECT':
             loot=self.loot_goal(obs,threats)
             return loot if loot is not None else self.explore(obs,threats)
@@ -331,7 +358,8 @@ class Bot:
         near=min((t['dist'] for t in threats if t['exposed']),default=999)
         boost=(me['grounded'] and me['energy']>32 and
                (not me['in_zone'] or (self.mode=='ESCAPE' and near<105) or
-                (self.mode=='ROTATE' and self.zone_cost(obs,pos,4)>0)))
+                (self.mode=='ROTATE' and self.zone_cost(obs,pos,4)>0) or
+                (self.mode=='CHASE' and me['energy']>45)))
         speed=self.stat(me,'boost_speed' if boost else 'walk_speed',19.5 if boost else 11.7)
         if any(w and w['kind']=='laser' and w.get('charge',0)>0 for w in me['weapons']):
             speed*=self.stat(me,'charge_move_mult',0.5)
@@ -393,7 +421,7 @@ class Bot:
     def should_fire(self,obs,target):
         if target is None or target.get('kind') not in ('mech','npc'):
             return False
-        if not self.healing and self.mode!='HEAL':
+        if self.mode=='CHASE' or (not self.healing and self.mode!='HEAL'):
             return True
         if target.get('kind')=='mech' and (self.commit or target.get('hp',1400)<=self.kill_hp):
             return True  # a kill is a full placement point
@@ -435,6 +463,49 @@ class Bot:
             return True
         return False
 
+    def laser_dodge(self,obs,action):
+        """An enemy is charging a laser at us (315 hitscan, cannot be sidestepped
+        once it tracks). The only defence is breaking line of sight before it
+        releases (~0.75 s): find a short reachable step that hides us."""
+        me=obs['self'];pos=me['pos'];now=obs['t']
+        chargers=self.tactics.laser_threats(obs)
+        if not chargers:
+            return False
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        body=[pos[0],pos[1],pos[2]+h*0.5]
+        def muzzle(m):
+            return [m['pos'][0],m['pos'][1],m['pos'][2]+7*(1+0.05*m.get('cubes',0))]
+        chargers=[m for m in chargers if self.world.ray_clear(muzzle(m),body)][:2]
+        if not chargers:
+            return False
+        best=None
+        deadline=self.deadline-0.006
+        for step in (5,8):
+            for i in range(16):
+                if time.perf_counter()>deadline:
+                    break
+                a=i*math.pi/8
+                d=(math.cos(a),math.sin(a))
+                q=(pos[0]+d[0]*step,pos[1]+d[1]*step)
+                if self.zone_cost(obs,q,3)>0 or not self.world.ground_segment(pos,q,r+0.3,h):
+                    continue
+                z=self.world.height(*q)
+                if all(not self.world.ray_clear(muzzle(m),[q[0],q[1],z+h*0.5]) and
+                       not self.world.ray_clear(muzzle(m),[q[0],q[1],z+h*0.9]) for m in chargers):
+                    # Prefer steps close to our current heading (less braking).
+                    v=me['vel']
+                    cost=step-0.1*(d[0]*v[0]+d[1]*v[1])
+                    if best is None or cost<best[0]:
+                        best=(cost,d)
+            if best is not None:
+                break
+        if best is None:
+            return False
+        action['move']=[best[1][0],best[1][1]]
+        action['boost']=bool(me['grounded'] and me['energy']>12)
+        self.dodge_until=now+0.5
+        return True
+
     def act(self,obs):
         # Reserve ~20 ms of the server's budget for transport, scheduling, and
         # machine variance. Expensive search/steering loops stop with a usable
@@ -458,6 +529,7 @@ class Bot:
         self.tactics.note_events(obs)
         self.tactics.observe_shots(obs)
         self.tactics.evaluate(obs)
+        self.combat.observe(obs)
         self.commit=self.tactics.committed
         self.kill_hp=self.tactics.kill_hp(me)
         hp=me['hp']/max(1,me['max_hp'])
@@ -469,12 +541,22 @@ class Bot:
         target=self.choose_target(obs,threats)
         exposed=[t for t in threats if t['exposed']]
         close=[t for t in exposed if t['dist']<115 and t['actor']['kind']=='mech']
+        chase=self.chase_target(obs) if target is None else None
+        # A clearly winnable kill is finished even when we are below the heal line.
+        finish=(target is not None and target['kind']=='mech'
+                and target.get('hp',1400)<0.4*target.get('max_hp',1400)
+                and me['hp']>1.2*target.get('hp',1400) and len(close)<2)
         z=obs['zone']
         travel=max(0,distance(pos,z['next_center'])-max(0,z['next_radius']-18))*1.6/max(1,self.stat(me,'walk_speed',11.7))
         urgent=(not me['in_zone'] or self.zone_cost(obs,pos,3)>0 or
                 (travel>0 and z['shrink_end']-now<travel+12))
         if urgent:
             self.mode='ROTATE'
+        elif finish:
+            self.mode='FIGHT'
+        elif chase is not None and len(close)<2:
+            self.mode='CHASE'
+            target=chase
         elif self.healing:
             self.mode='ESCAPE' if exposed else 'HEAL'
         elif len(close)>=2 and not self.commit:
@@ -485,7 +567,8 @@ class Bot:
             self.mode='HEAL'
         else:
             self.mode='COLLECT'
-        if self.goal is None or now-self.goal_at>0.8 or self.mode!=self.previous_mode:
+        if (self.goal is None or now-self.goal_at>(0.4 if self.mode=='CHASE' else 0.8)
+                or self.mode!=self.previous_mode):
             self.goal=self.choose_goal(obs,threats,target)
             self.goal_at=now
         self.previous_mode=self.mode
@@ -495,7 +578,8 @@ class Bot:
         self.last_waypoint=waypoint
         action=self.steer(obs,waypoint,threats)
         self.juking=self.juke(obs,target,threats,action)
-        wants_progress=(not self.juking) and distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
+        self.dodging=self.laser_dodge(obs,action)
+        wants_progress=(not self.juking) and (not self.dodging) and distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
         self.history.append((now,tuple(pos[:2]),float(wants_progress)))
         while self.history and now-self.history[0][0]>1.5:
             self.history.popleft()
@@ -513,19 +597,24 @@ class Bot:
         else:
             # Torso-only scan; movement does not depend on the look direction.
             yaw=(now*0.9+self.slot*0.7+math.pi)%(2*math.pi)-math.pi
+            heard=self.tactics.threat_bearing(now)
+            if heard is not None:
+                yaw=heard  # face hunters before they arrive: front armor + vision
             if self.damage_bearing is not None and now-self.damage_bearing_at<2:
                 yaw=self.damage_bearing
         allow_fire=self.should_fire(obs,target)
         # Shoot a nearby visible crate only when healthy and unthreatened. Never
         # use remembered crates for firing: they may already have been destroyed.
-        if self.mode=='COLLECT' and not threats and hp>0.88:
+        if (self.mode=='COLLECT' and hp>0.7
+                and not any(t['actor']['kind']=='mech' for t in threats) and not exposed):
             crates=[c for c in obs.get('crates',[]) if distance(pos,c['pos'])<65 and distance(c['pos'],self.goal)<8]
             if crates:
                 target=min(crates,key=lambda c:distance(pos,c['pos']))
                 allow_fire=True
         if target is None and facing is not None:
             target=facing
-        action.update(self.combat.command(obs,target,allow_fire,yaw,
+        reserve=8 if self.mode in ('FIGHT','CHASE') else 28
+        action.update(self.combat.command(obs,target,allow_fire,yaw,reserve=reserve,
                                          mobile=self.mode in ('ESCAPE','ROTATE') or action['boost']))
         # Reload early while safe, rather than entering a fight with two rounds.
         gun=next((w for w in me['weapons'] if w and w['kind']=='gun'),None)

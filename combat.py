@@ -1,6 +1,17 @@
-"""Projectile leading, shared-torso aim, and weapon trigger scheduling."""
+"""Projectile leading, shared-torso aim, and weapon trigger scheduling.
+
+v0.4: adaptive lead. House bots juke (new heading every ~0.7-1.0 s), so full
+linear lead over a 0.3-0.6 s flight often misses. Each gun shot is tagged with
+the lead fraction used; `hit` events are credited back to it, and Thompson
+sampling picks the fraction that is actually landing in this match. A target
+that is charging a laser moves straight at half speed: always lead it fully.
+"""
 import math
+import random
+from collections import deque
 from geometry import clamp, distance
+
+LEAD_OPTIONS=(1.0,0.6,0.3)
 
 
 def angle_diff(a,b):
@@ -41,8 +52,44 @@ def aligned(actual,desired,radius,dist):
 
 
 class Combat:
-    def __init__(self,world):
+    def __init__(self,world,seed=0):
         self.world=world
+        self.rng=random.Random((seed or 0)^0x1EAD)
+        # Beta priors per lead option: [hits, misses]. Slight prior for 0.6.
+        self.lead_stats=[[1.0,2.0],[1.3,2.0],[1.0,2.0]]
+        self.lead_idx=1
+        self.lead_until=-1.0
+        self.pending=deque()   # (arrival_t, target_id, option)
+
+    def observe(self,obs):
+        """Credit gun hits to the lead option that fired them; expire misses."""
+        now=obs['t']
+        for e in obs.get('events',[]) or []:
+            if e.get('type')!='hit' or e.get('weapon')!='gun':
+                continue
+            best=None
+            for i,(arr,tid,opt) in enumerate(self.pending):
+                if tid==e.get('target') and abs(arr-now)<0.4:
+                    if best is None or abs(arr-now)<abs(self.pending[best][0]-now):
+                        best=i
+            if best is not None:
+                _,_,opt=self.pending[best]
+                del self.pending[best]
+                self.lead_stats[opt][0]+=1
+        while self.pending and self.pending[0][0]<now-0.4:
+            _,_,opt=self.pending.popleft()
+            self.lead_stats[opt][1]+=1
+        # Forget slowly so the choice follows the current opponent.
+        for st in self.lead_stats:
+            if st[0]+st[1]>60:
+                st[0]*=0.97; st[1]*=0.97
+
+    def pick_lead(self,now):
+        if now>=self.lead_until:
+            draws=[self.rng.betavariate(h,m) for h,m in self.lead_stats]
+            self.lead_idx=max(range(len(draws)),key=lambda i:draws[i])
+            self.lead_until=now+1.0
+        return self.lead_idx
 
     def command(self,obs,target,allow_fire,default_yaw,reserve=28,mobile=False):
         me=obs['self']
@@ -69,9 +116,15 @@ class Combat:
         # charge. An existing charge is released promptly to regain mobility.
         laser_active=laser is not None and (laser.get('charge',0)>0 or
                      (not mobile and laser['cooldown']<=0 and 50<dist<laser['stats']['range']))
+        lead_opt=None
         if gun_idx is not None:
             gun=weapons[gun_idx]
-            gun_point=intercept(origin,pt,vel,gun['stats']['speed'])
+            if target.get('kind')=='mech' and not target.get('charging'):
+                lead_opt=self.pick_lead(obs['t'])
+                f=LEAD_OPTIONS[lead_opt]
+            else:
+                f=1.0
+            gun_point=intercept(origin,pt,[vel[0]*f,vel[1]*f,vel[2]*f],gun['stats']['speed'])
         # Keep leading the gun during most of the charge. Only transfer the
         # shared torso to hitscan aim just before releasing the laser.
         laser_aim=(laser_active and laser.get('charge',0)>0 and
@@ -92,6 +145,9 @@ class Combat:
                                     and aligned(me['aim'],ga,tr,dist)
                                     and aligned(out['aim'],ga,tr,dist)
                                     and self.world.ray_clear(origin,gun_point))
+                    if out['fire'][i] and lead_opt is not None and w.get('cooldown',0)<=0.1:
+                        self.pending.append((obs['t']+math.dist(origin,gun_point)/ws['speed'],
+                                             target.get('id'),lead_opt))
             elif w['kind']=='laser':
                 charge=w.get('charge',0)
                 clear=dist<=ws['range'] and self.world.ray_clear(origin,pt)

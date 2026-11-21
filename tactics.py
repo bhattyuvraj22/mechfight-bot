@@ -31,6 +31,9 @@ UPGRADE_PRIORITY = [
     'lightning_range', 'jets', 'reactor', 'gyros', 'capacitor', 'lightning_chain',
     'sensors', 'laser_pierce', 'mortar_reload', 'mortar_velocity', 'mortar_splash',
 ]
+# Sounds that mean "a mech is here and probably coming for us".
+THREAT_SOUNDS = {'step': 3.0, 'boost': 2.5, 'laser_charge': 3.0, 'gun': 1.5,
+                 'lightning': 2.0, 'laser': 1.5, 'jet': 1.5, 'reload': 2.0}
 
 
 def pick_upgrade(offer, held_kinds=()):
@@ -39,8 +42,9 @@ def pick_upgrade(offer, held_kinds=()):
         return None
     order = list(UPGRADE_PRIORITY)
     if 'lightning' in held_kinds:  # lightning is energy-limited; fix that early
-        order.remove('lightning_efficiency')
-        order.insert(2, 'lightning_efficiency')
+        for i, cid in enumerate(('lightning_efficiency', 'reactor', 'capacitor')):
+            order.remove(cid)
+            order.insert(1 + i, cid)
 
     def rank(i):
         cid = choices[i].get('id')
@@ -90,6 +94,8 @@ class Tactics:
         self.headon_votes = 0.0   # bullets aimed where we were
         self.committed = False
         self.ratio = 0.0
+        self.last_beam = {}       # enemy id -> time its laser last fired
+        self.heard = []           # (t, bearing, weight)
 
     # ---------------------------------------------------------------- memory
     def note_events(self, obs):
@@ -97,6 +103,55 @@ class Tactics:
         for e in obs.get('events', []) or []:
             if e.get('type') == 'damaged' and e.get('by') is not None:
                 self.attackers[e['by']] = now
+                if e.get('weapon') == 'laser':
+                    self.last_beam[e['by']] = now
+        for b in obs.get('beams', []) or []:
+            if b.get('kind') == 'laser' and b.get('by') is not None:
+                self.last_beam[b['by']] = now - b.get('age', 0)
+        for snd in obs.get('sounds', []) or []:
+            w = THREAT_SOUNDS.get(snd.get('kind'))
+            if w and snd.get('dist') in ('near', 'mid') and snd.get('bearing') is not None:
+                if snd.get('dist') == 'near':
+                    w *= 2
+                self.heard.append((now - snd.get('age', 0), snd['bearing'], w))
+        self.heard = [h for h in self.heard if now - h[0] < 2.0][-24:]
+
+    def threat_bearing(self, now):
+        """Weighted mean bearing of recent threatening sounds, or None."""
+        sx = sy = 0.0
+        for t, b, w in self.heard:
+            k = w * max(0.0, 1 - (now - t) / 2.0)
+            sx += k * math.cos(b)
+            sy += k * math.sin(b)
+        if math.hypot(sx, sy) < 1.5:
+            return None
+        return math.atan2(sy, sx)
+
+    def laser_ready(self, enemy, now):
+        """Could this enemy fire a laser at us in the next ~0.8 s?"""
+        if 'laser' not in (enemy.get('weapons') or []):
+            return False
+        if enemy.get('charging'):
+            return True
+        cd = self.config.get('weapons', {}).get('laser', {}).get('cooldown', 1.65)
+        return now - self.last_beam.get(enemy['id'], -100) > cd - 0.3
+
+    def laser_threats(self, obs):
+        """Visible enemies charging a laser with their torso pointed at us."""
+        me = obs['self']
+        out = []
+        for m in obs.get('mechs', []) or []:
+            if m.get('kind') != 'mech' or not m.get('charging'):
+                continue
+            d = _dist2(me['pos'], m['pos'])
+            if d > 300:
+                continue
+            bearing = math.atan2(me['pos'][1] - m['pos'][1], me['pos'][0] - m['pos'][0])
+            off = abs((m['aim'][0] - bearing + math.pi) % (2 * math.pi) - math.pi)
+            # They slew at 4 rad/s, so anything within ~35 deg is on us by release.
+            if off < math.radians(35):
+                out.append(m)
+        return out
 
     def recent_attacker(self, mech_id, now, window=2.5):
         return now - self.attackers.get(mech_id, -100) < window
