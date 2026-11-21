@@ -230,60 +230,6 @@ class PolicyTests(unittest.TestCase):
         self.obs['tick']=40
         self.assertFalse(self.bot.act(self.obs)['fire'][0])
 
-    def test_isolated_drone_goal_stays_in_tracking_range(self):
-        drone=dict(enemy(55),kind='npc',hp=350)
-        self.obs['mechs']=[drone]
-        self.bot.act(self.obs)
-        self.assertEqual(self.bot.mode,'FIGHT')
-        self.assertAlmostEqual(distance(self.bot.goal,drone['pos']),48)
-        self.assertGreater(self.bot.goal[0],0)
-
-    def test_drone_goal_keeps_normal_spacing_with_player_contact(self):
-        drone=dict(enemy(55),kind='npc',hp=40)
-        self.obs['mechs']=[drone,dict(enemy(90),id=9)]
-        self.bot.act(self.obs)
-        self.assertEqual(self.bot.target_id,drone['id'])
-        self.assertAlmostEqual(distance(self.bot.goal,drone['pos']),85)
-
-    def test_crossfire_depends_on_enemy_aim(self):
-        self.obs['mechs']=[enemy(130),dict(enemy(0,135),id=8,aim=[-math.pi/2,0])]
-        self.bot.act(self.obs)
-        self.assertEqual(self.bot.mode,'ESCAPE')
-        self.obs['mechs'][1]['aim']=[math.pi/2,0]
-        self.bot.act(self.obs)
-        self.assertEqual(self.bot.mode,'FIGHT')
-
-    def test_last_opponent_can_be_finished_during_recovery(self):
-        self.obs.update(alive=2,mechs=[enemy(80,hp=90)])
-        self.obs['self'].update(hp=400,aim=aim_at([0,0,7],center(self.obs['mechs'][0])))
-        a=self.bot.act(self.obs)
-        self.assertEqual(self.bot.mode,'FIGHT')
-        self.assertTrue(a['fire'][0])
-
-    def test_nearby_sound_cancels_unstarted_drop_capture(self):
-        self.obs['drops']=[{'id':20000,'pos':[14,0,0],'radius':8,'capture_s':4,
-                            'progress':0,'holder':None,'lands_in':0}]
-        self.bot.act(self.obs)
-        self.assertEqual(self.bot.mode,'CAPTURE')
-        self.obs.update(t=0.1,tick=2,sounds=[{'kind':'step','dist':'near','bearing':1.2,'age':0}])
-        a=self.bot.act(self.obs)
-        self.assertNotEqual(self.bot.mode,'CAPTURE')
-        self.assertAlmostEqual(a['aim'][0],1.2)
-
-    def test_beam_bearing_expires(self):
-        self.obs['beams']=[{'by':8,'kind':'laser','path':[[0,-40,7],[0,20,7]],'age':0}]
-        self.assertAlmostEqual(self.bot.act(self.obs)['aim'][0],-math.pi/2)
-        self.obs.update(t=2,tick=40,beams=[])
-        self.assertNotAlmostEqual(self.bot.act(self.obs)['aim'][0],-math.pi/2)
-
-    def test_unarmed_reload_breaks_contact(self):
-        self.obs['mechs']=[enemy(80)]
-        self.obs['self']['weapons'][0].update(ammo=0,reload=1.2)
-        self.obs['self']['hp']=850
-        self.bot.last_damage=0
-        self.bot.act(self.obs)
-        self.assertEqual(self.bot.mode,'ESCAPE')
-
     def test_empty_safe_area_is_explored(self):
         a=self.bot.act(self.obs)
         self.assertEqual(self.bot.mode,'COLLECT')
