@@ -1,4 +1,4 @@
-"""Oval Sentinel v0.2: mobile return fire, resource seeking and corner handling."""
+"""Oval Sentinel v0.3: adaptive dodging, committed fights, drone farming, drops."""
 import math
 import time
 from collections import deque
@@ -7,10 +7,11 @@ import mechfight as mf
 from combat import Combat, aim_at, center
 from geometry import World, clamp, distance, unit
 from navigation import Navigator
+from tactics import Tactics, pick_upgrade
 
 
 class Bot:
-    name='Oval-Sentinel-v2-side'
+    name='Oval-Sentinel-v0.3'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -37,6 +38,11 @@ class Bot:
         self.damage_bearing_at=-100
         self.failed_goals={}
         self.last_waypoint=None
+        self.tactics=Tactics(self.config,hello.get('seed',0))
+        self.now=0
+        self.commit=False
+        self.kill_hp=220
+        self.juking=False
 
     def stat(self,me,key,default):
         return me['stats'].get(key,self.config['mech'].get(key,default))
@@ -70,7 +76,7 @@ class Bot:
                 continue
             exposed=self.world.ray_clear(muzzle,center(e))
             # NPCs are locally dangerous but are not placement targets.
-            if e['kind']=='npc' and d>60:
+            if e['kind']=='npc' and d>self.tactics.npc_reach(obs):
                 continue
             result.append({'actor':e,'dist':d,'exposed':exposed})
         return result
@@ -84,7 +90,8 @@ class Bot:
             hp=e.get('hp',1400)
             return (t['dist']*0.45+hp*0.045+(65 if e['kind']=='npc' else 0)
                     -(30 if e['id']==self.target_id else 0)
-                    -(85 if hp<220 else 0))
+                    -(85 if hp<self.kill_hp else 0)
+                    -(40 if self.tactics.recent_attacker(e['id'],self.now) else 0))
         target=min(candidates,key=score)['actor']
         self.target_id=target['id']
         return target
@@ -93,17 +100,7 @@ class Bot:
         offer=obs.get('offer')
         if not offer:
             return None
-        me=obs['self']
-        ranks={'nanites':95,'servos':92,'armor':85,'jets':82,'plating':76,
-               'reactor':72,'gun_damage':67,'gun_rate':64,'gun_mag':63,
-               'laser_damage':66,'laser_charge':65,'lightning_range':70,
-               'lightning_efficiency':69,'capacitor':61,'gun_velocity':60,
-               'gyros':40,'sensors':38,'lightning_chain':35,'laser_pierce':30}
-        if me['hp']/me['max_hp']<0.4:
-            ranks['plating']+=18
-        stacks=me.get('upgrades',[])
-        return max(range(len(offer['choices'])),key=lambda i:
-                   ranks.get(offer['choices'][i]['id'],20)-8*stacks.count(offer['choices'][i]['id']))
+        return pick_upgrade(offer,[w['kind'] for w in obs['self']['weapons'] if w])
 
     def update_items(self,obs):
         now=obs['t']
@@ -171,7 +168,37 @@ class Bot:
                 continue
             bonus={'cubes':40,'pickups':55,'crates':12}[kind]
             choices.append((d-bonus+(now-seen)*2,p[:2]))
+        if not near_only:
+            for p in self.drop_points(obs,threats):
+                choices.append((distance(pos,p)-120,p))
         return min(choices,key=lambda it:it[0])[1] if choices else None
+
+    def drop_points(self,obs,threats):
+        # Supply drop: 3 cubes, full HP and full energy for 4 s alone in the ring.
+        me=obs['self'];pos=me['pos'];out=[]
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        speed=max(1,self.stat(me,'walk_speed',11.7))
+        for d in obs.get('drops',[]) or []:
+            p=d['pos'];dist=distance(pos,p)
+            if dist>170 or d.get('lands_in',0)>dist/speed+8 or self.zone_cost(obs,p,10)>0:
+                continue
+            if any(distance(p,t['actor']['pos'])<60 for t in threats[:4] if t['actor']['kind']=='mech'):
+                continue
+            if self.world.ground_free(*p[:2],r+0.3,h):
+                out.append(tuple(p[:2]))
+        return out
+
+    def preferred_range(self,me,target):
+        pos=me['pos']
+        kinds=[w['kind'] for w in me['weapons'] if w]
+        preferred=105 if 'laser' in kinds else 85
+        if 'lightning' in kinds and me['energy']>55 and distance(pos,target['pos'])<55:
+            preferred=34
+        thp=target.get('hp',1400)
+        # Close in to finish: gun accuracy rises sharply inside ~60 m.
+        if target.get('kind')=='mech' and thp<0.3*target.get('max_hp',1400) and me['hp']>thp:
+            preferred=min(preferred,55)
+        return preferred
 
     def explore(self,obs,threats):
         now=obs['t'];me=obs['self'];pos=me['pos']
@@ -225,7 +252,7 @@ class Bot:
                 return loot
             if target['kind']=='mech':
                 dx,dy=unit(pos[0]-target['pos'][0],pos[1]-target['pos'][1])
-                radial=clamp(85-distance(pos,target['pos']),-16,12)
+                radial=clamp(self.preferred_range(me,target)-distance(pos,target['pos']),-16,12)
                 sign=1 if int(obs['t']/1.8)%2==0 else -1
                 for lateral in (14*sign,-14*sign):
                     q=(pos[0]+radial*dx-lateral*dy,pos[1]+radial*dy+lateral*dx)
@@ -234,10 +261,7 @@ class Bot:
                             self.world.ray_clear([*q,self.world.height(*q)+self.stat(me,'muzzle_height',7)],center(target))):
                         return q
             dx,dy=unit(pos[0]-target['pos'][0],pos[1]-target['pos'][1])
-            kinds=[w['kind'] for w in me['weapons'] if w]
-            preferred=105 if 'laser' in kinds else 85
-            if 'lightning' in kinds and me['energy']>55 and distance(pos,target['pos'])<55:
-                preferred=34
+            preferred=self.preferred_range(me,target)
             q=self.walkable_goal((target['pos'][0]+dx*preferred,target['pos'][1]+dy*preferred),me)
             # Never pursue a preferred range into the storm.
             if self.zone_cost(obs,q,6)<3:
@@ -248,7 +272,8 @@ class Bot:
             return loot if loot is not None else self.explore(obs,threats)
         if self.mode in ('ESCAPE','HEAL','ROTATE'):
             deadline=min(self.deadline-0.012,time.perf_counter()+0.007)
-            points=[anchor,tuple(pos[:2])]+self.world.cover_points(pos,radius)
+            drops=self.drop_points(obs,threats) if self.mode=='HEAL' else []
+            points=[anchor,tuple(pos[:2])]+drops+self.world.cover_points(pos,radius)
             points.extend((pos[0]+24*math.cos(i*math.pi/4),pos[1]+24*math.sin(i*math.pi/4)) for i in range(8))
             candidates=[]
             for q in points:
@@ -265,6 +290,8 @@ class Bot:
                     score+=12  # A nearby point behind a wall may need a long detour.
                 if self.mode=='ROTATE':
                     score+=distance(q,anchor)*1.8
+                if q in drops:
+                    score-=80  # a drop is a full heal
                 score+=self.exposure(p,threats,height)*1.8
                 if self.mode=='ESCAPE':
                     score+=sum(max(0,75-distance(q,t['actor']['pos'])) for t in threats[:3])
@@ -368,12 +395,45 @@ class Bot:
             return False
         if not self.healing and self.mode!='HEAL':
             return True
+        if target.get('kind')=='mech' and (self.commit or target.get('hp',1400)<=self.kill_hp):
+            return True  # a kill is a full placement point
         me=obs['self']
         # No healing can occur while storm damage keeps resetting the timer.
         # Return fire under continuing attack, but stop after breaking contact
         # so healing can actually start. Very close enemies merit self-defence.
         return (not me['in_zone'] or obs['t']-self.last_damage<1.2
                 or distance(me['pos'],target['pos'])<45)
+
+    def juke(self,obs,target,threats,action):
+        """Replace the strafe with random full-speed headings, but only once the
+        bullets we see are leading us; head-on shooters keep the HEAD strafe."""
+        if (self.mode!='FIGHT' or target is None or target.get('kind')!='mech'
+                or not self.tactics.should_juke()):
+            return False
+        if not any(t['exposed'] for t in threats[:3]):
+            return False
+        me=obs['self'];pos=me['pos']
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        speed=self.stat(me,'walk_speed',11.7)
+        accel=self.stat(me,'ground_accel',58.5)
+        muzzle=self.stat(me,'muzzle_height',7)
+        opts=self.tactics.juke_options(obs,target['pos'],self.preferred_range(me,target),speed,accel)
+        fallback=None
+        for i,v in enumerate(opts[:6]):
+            q=(pos[0]+v[0]*7,pos[1]+v[1]*7)
+            if self.zone_cost(obs,q,6)>0 or not self.world.ground_segment(pos,q,r+0.3,h):
+                if i==0:
+                    self.tactics.flip(obs['t'])
+                continue
+            if self.world.ray_clear([*q,self.world.height(*q)+muzzle],center(target)):
+                action['move']=[v[0],v[1]];action['boost']=False
+                return True
+            if fallback is None:
+                fallback=v
+        if fallback is not None:
+            action['move']=[fallback[0],fallback[1]];action['boost']=False
+            return True
+        return False
 
     def act(self,obs):
         # Reserve ~20 ms of the server's budget for transport, scheduling, and
@@ -394,11 +454,17 @@ class Bot:
         if damage:
             self.damage_bearing=damage['bearing']
             self.damage_bearing_at=now
+        self.now=now
+        self.tactics.note_events(obs)
+        self.tactics.observe_shots(obs)
+        self.tactics.evaluate(obs)
+        self.commit=self.tactics.committed
+        self.kill_hp=self.tactics.kill_hp(me)
         hp=me['hp']/max(1,me['max_hp'])
-        if hp<0.53:
+        if hp<0.53 and not self.commit:
             self.healing=True
-        elif hp>0.9:
-            self.healing=False
+        elif hp>0.9 or self.commit:
+            self.healing=False  # a winning trade is finished, not fled
         threats=self.threat_list(obs)
         target=self.choose_target(obs,threats)
         exposed=[t for t in threats if t['exposed']]
@@ -411,7 +477,7 @@ class Bot:
             self.mode='ROTATE'
         elif self.healing:
             self.mode='ESCAPE' if exposed else 'HEAL'
-        elif len(close)>=2:
+        elif len(close)>=2 and not self.commit:
             self.mode='ESCAPE'
         elif target is not None:
             self.mode='FIGHT'
@@ -428,7 +494,8 @@ class Bot:
                                    self.stat(me,'max_slope_deg',50),now)
         self.last_waypoint=waypoint
         action=self.steer(obs,waypoint,threats)
-        wants_progress=distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
+        self.juking=self.juke(obs,target,threats,action)
+        wants_progress=(not self.juking) and distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
         self.history.append((now,tuple(pos[:2]),float(wants_progress)))
         while self.history and now-self.history[0][0]>1.5:
             self.history.popleft()

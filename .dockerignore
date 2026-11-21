@@ -4,4 +4,5 @@
 !geometry.py
 !navigation.py
 !mechfight.py
+!tactics.py
 !Dockerfile
