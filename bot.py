@@ -1,4 +1,4 @@
-"""Oval Sentinel v0.4: mobile ranged duels and earlier crossfire detection."""
+"""Oval Sentinel v0.4.1: mobile ranged duels and earlier crossfire detection."""
 import math
 import time
 from collections import deque
@@ -10,7 +10,7 @@ from navigation import Navigator
 
 
 class Bot:
-    name='Oval-Sentinel-v0.4'
+    name='Oval-Sentinel-v0.4.1'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -320,8 +320,10 @@ class Bot:
                 preferred=34
             radial=clamp(preferred-d,-6,15)
             side=1 if (int(obs['t']/2.7)+self.slot)%2 else -1
-            for sign in (side,-side):
-                q=(pos[0]+dx*radial-sign*dy*18,pos[1]+dy*radial+sign*dx*18)
+            steps=[(radial,side*18),(radial,-side*18),
+                   (radial,side*6),(radial,-side*6),(12,0),(5,0)]
+            for outward,lateral in steps:
+                q=(pos[0]+dx*outward-dy*lateral,pos[1]+dy*outward+dx*lateral)
                 if (self.zone_cost(obs,q,6)<=self.zone_cost(obs,pos,6)
                         and self.world.ground_segment(pos,q,radius+0.3,height)):
                     return q
@@ -365,6 +367,29 @@ class Bot:
             if candidates:
                 return min(candidates,key=lambda item:item[0])[1]
         return anchor
+
+    def crate_waypoint(self,obs,crate,approach):
+        me=obs['self']
+        pos=me['pos']
+        p=crate['pos']
+        origin=[*pos[:2],pos[2]+self.stat(me,'muzzle_height',7)]
+        aim_point=[*p[:2],p[2]+1]
+        pitch=aim_at(origin,aim_point)[1]
+        if (self.stat(me,'min_pitch',-0.7)<=pitch<=self.stat(me,'max_pitch',1.3)
+                and self.world.ray_clear(origin,aim_point)):
+            return pos[:2]
+        if distance(pos,p)>20:
+            return approach
+        # Back away to open a shot; try the sides when directly behind is blocked.
+        bearing=math.atan2(pos[1]-p[1],pos[0]-p[0])
+        radius=self.stat(me,'radius',2.5)+0.3
+        height=self.stat(me,'height',9)
+        for turn in (0,math.pi/2,-math.pi/2,math.pi):
+            q=(p[0]+20*math.cos(bearing+turn),p[1]+20*math.sin(bearing+turn))
+            if (self.zone_cost(obs,q,4)<=self.zone_cost(obs,pos,4)
+                    and self.world.ground_segment(pos,q,radius,height)):
+                return q
+        return approach
 
     def projectile_cost(self,obs,end):
         me=obs['self']
@@ -500,6 +525,7 @@ class Bot:
         elif hp>0.9:
             self.healing=False
         threats=self.threat_list(obs)
+        previous_target=self.target_id
         target=self.choose_target(obs,threats)
         exposed=[t for t in threats if t['exposed']]
         shooters=[t for t in exposed if t['actor']['kind']=='mech'
@@ -538,13 +564,23 @@ class Bot:
             self.mode='HEAL'
         else:
             self.mode='COLLECT'
-        if self.goal is None or now-self.goal_at>0.8 or self.mode!=self.previous_mode:
+        switched=self.mode=='FIGHT' and previous_target!=self.target_id
+        if switched:
+            self.nav.reset()
+        if switched or self.goal is None or now-self.goal_at>0.8 or self.mode!=self.previous_mode:
             self.goal=self.choose_goal(obs,threats,target)
             self.goal_at=now
         self.previous_mode=self.mode
         # Keep the goal stable between strategic updates so A* can finish.
         waypoint=self.nav.waypoint(pos,self.goal,self.stat(me,'radius',2.5),self.stat(me,'height',9),
                                    self.stat(me,'max_slope_deg',50),now)
+        crate=None
+        if self.mode=='COLLECT' and not threats and hp>0.88 and now-self.damage_bearing_at>=2:
+            crates=[c for c in obs['crates'] if distance(pos,c['pos'])<65
+                    and distance(c['pos'],self.goal)<8]
+            if crates:
+                crate=min(crates,key=lambda c:distance(c['pos'],self.goal))
+                waypoint=self.crate_waypoint(obs,crate,waypoint)
         self.last_waypoint=waypoint
         action=self.steer(obs,waypoint,threats)
         wants_progress=distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
@@ -560,6 +596,8 @@ class Bot:
                 self.failed_goals[self.cell(self.goal)]=now+5
                 self.explore_until=-1
         facing=target or (threats[0]['actor'] if threats else None)
+        if target is None and self.damage_bearing is not None and now-self.damage_bearing_at<2:
+            facing=None
         if facing is not None:
             yaw=math.atan2(facing['pos'][1]-pos[1],facing['pos'][0]-pos[0])
         else:
@@ -570,13 +608,9 @@ class Bot:
             if self.damage_bearing is not None and now-self.damage_bearing_at<2:
                 yaw=self.damage_bearing
         allow_fire=self.should_fire(obs,target)
-        # Shoot a nearby visible crate only when healthy and unthreatened. Never
-        # use remembered crates for firing: they may already have been destroyed.
-        if self.mode=='COLLECT' and not threats and hp>0.88:
-            crates=[c for c in obs.get('crates',[]) if distance(pos,c['pos'])<65 and distance(c['pos'],self.goal)<8]
-            if crates:
-                target=min(crates,key=lambda c:distance(pos,c['pos']))
-                allow_fire=True
+        if crate is not None:
+            target=crate
+            allow_fire=True
         if target is None and facing is not None:
             target=facing
         action.update(self.combat.command(obs,target,allow_fire,yaw,

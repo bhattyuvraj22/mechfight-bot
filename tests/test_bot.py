@@ -327,6 +327,52 @@ class PolicyTests(unittest.TestCase):
         self.obs.update(t=1.0,tick=20,sounds=[])
         self.assertNotEqual(self.bot.act(self.obs)['aim'][0],-1.4)
 
+    def test_corridor_retreat_when_long_strafes_blocked(self):
+        self.bot.world=toy_world([prism(-40,10,40,15),prism(-40,-15,40,-10)])
+        self.bot.nav=Navigator(self.bot.world)
+        self.bot.combat=Combat(self.bot.world)
+        self.obs['mechs']=[enemy(90)]
+        self.assertLess(self.bot.act(self.obs)['move'][0],-0.3)
+
+    def test_crate_backs_off_then_holds_and_fires(self):
+        crate={'id':1000,'pos':[4,0,0],'hp':300}
+        self.obs['crates']=[crate]
+        self.assertLess(self.bot.act(self.obs)['move'][0],0)
+        self.obs.update(t=1,tick=20)
+        self.obs['self'].update(pos=[-16,0,0],aim=aim_at([-16,0,7],[4,0,1]))
+        a=self.bot.act(self.obs)
+        self.assertEqual(a['move'],[0,0])
+        self.assertTrue(a['fire'][0])
+        self.obs.update(t=2,tick=40,crates=[],cubes=[{'id':9000,'pos':[4,0,0]}])
+        self.assertGreater(self.bot.act(self.obs)['move'][0],0)
+
+    def test_incoming_hit_overrides_occluded_enemy(self):
+        self.bot.world=toy_world([prism(10,-10,22,10)])
+        self.bot.nav=Navigator(self.bot.world)
+        self.bot.combat=Combat(self.bot.world)
+        self.obs['mechs']=[enemy(40)]
+        self.obs['events']=[{'type':'damaged','amount':50,'by':9,'bearing':math.pi,'weapon':'gun'}]
+        a=self.bot.act(self.obs)
+        self.assertAlmostEqual(abs(a['aim'][0]),math.pi)
+        self.assertEqual(a['fire'],[False,False])
+
+    def test_new_fight_target_refreshes_movement_immediately(self):
+        self.obs['mechs']=[enemy(80)]
+        self.bot.act(self.obs)
+        self.obs.update(t=0.1,tick=2,mechs=[dict(enemy(-80),id=8)])
+        a=self.bot.act(self.obs)
+        self.assertGreater(self.bot.goal[0],0)
+        self.assertGreater(a['move'][0],0)
+
+    def test_lightning_uses_documented_cone(self):
+        self.obs['mechs']=[enemy(40)]
+        me=self.obs['self']
+        me['weapons'][1]={'kind':'lightning','cooldown':0,
+                          'stats':self.bot.config['weapons']['lightning']}
+        for angle,expected in [(22,True),(32,False)]:
+            me['aim']=[math.radians(angle),0]
+            self.assertEqual(self.bot.act(self.obs)['fire'][1],expected)
+
     def test_boost_recharges_before_restarting(self):
         b=self.bot;o=self.obs
         b.mode='ESCAPE';o['self']['hp']=350
