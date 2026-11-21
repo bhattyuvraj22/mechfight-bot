@@ -1,6 +1,10 @@
 """Projectile leading, shared-torso aim, and weapon trigger scheduling.
 
-v0.4: adaptive lead. House bots juke (new heading every ~0.7-1.0 s), so full
+Experiment E1: fixed 60% lead for non-charging mechs.
+The original adaptive-learning bookkeeping below is retained for an isolated
+comparison; pick_lead bypasses its sampler.
+
+Original v0.4 rationale: adaptive lead. House bots juke (new heading every ~0.7-1.0 s), so full
 linear lead over a 0.3-0.6 s flight often misses. Each gun shot is tagged with
 the lead fraction used; `hit` events are credited back to it, and Thompson
 sampling picks the fraction that is actually landing in this match. A target
@@ -85,11 +89,9 @@ class Combat:
                 st[0]*=0.97; st[1]*=0.97
 
     def pick_lead(self,now):
-        if now>=self.lead_until:
-            draws=[self.rng.betavariate(h,m) for h,m in self.lead_stats]
-            self.lead_idx=max(range(len(draws)),key=lambda i:draws[i])
-            self.lead_until=now+1.0
-        return self.lead_idx
+        # Experiment E1: hold 60% lead for ordinary moving mechs. Charging
+        # mechs and NPCs retain the existing full-intercept calculation.
+        return 1  # LEAD_OPTIONS[1] == 0.6
 
     def command(self,obs,target,allow_fire,default_yaw,reserve=28,mobile=False):
         me=obs['self']

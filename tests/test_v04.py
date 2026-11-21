@@ -38,14 +38,15 @@ class LeadTests(unittest.TestCase):
         c.observe({'t': 11.0, 'events': []})
         self.assertGreater(c.lead_stats[0][1], before)
 
-    def test_learns_best_lead(self):
+    def test_fixed_lead_is_stable_despite_noisy_hit_history(self):
         c = Combat(toy_world([]))
         c.lead_stats = [[1, 30], [1, 30], [25, 5]]
         picks = []
         for k in range(20):
             c.lead_until = -1
             picks.append(c.pick_lead(k))
-        self.assertGreater(picks.count(2), 16)
+        self.assertEqual(picks, [1] * 20)
+        self.assertEqual(LEAD_OPTIONS[picks[0]], 0.6)
         self.assertEqual(len(LEAD_OPTIONS), 3)
 
 
