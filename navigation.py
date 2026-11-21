@@ -21,6 +21,7 @@ class Navigator:
         self.path=[]
         self.search=None
         self.goal=None
+        self.failed_until=0
 
     def node(self,p):
         return round(p[0]/self.STEP),round(p[1]/self.STEP)
@@ -64,7 +65,9 @@ class Navigator:
             self.goal=goal
         if self.path and distance(pos,self.path[0])>24:
             self.path=[]
-        while self.path and distance(pos,self.path[0])<4:
+        # Four-metre acceptance skipped turns on a four-metre grid. Reach the
+        # corner first; the visibility-based shortcut below may still skip it.
+        while self.path and distance(pos,self.path[0])<1.2:
             self.path.pop(0)
         if self.path:
             for idx in range(min(3,len(self.path)-1),0,-1):
@@ -75,6 +78,8 @@ class Navigator:
         if now<self.failed_until:
             return goal
         deadline=time.perf_counter()+budget
+        if self.search is not None and distance(pos,self.point(self.search['start']))>24:
+            self.search=None
         if self.search is None:
             start=self.nearest(pos,connected=True)
             end=self.nearest(goal)
@@ -123,4 +128,18 @@ class Navigator:
         elif not s['heap'] or len(s['closed'])>12000:
             self.search=None
             self.failed_until=now+1
+        if self.search is not None:
+            # While search continues, follow a reachable part of the explored
+            # route instead of repeatedly pushing straight into the obstacle.
+            s=self.search
+            if s['heap']:
+                node=s['heap'][0][1]
+                trail=[]
+                while node!=s['start'] and node in s['parent']:
+                    trail.append(self.point(node))
+                    node=s['parent'][node]
+                trail.reverse()
+                for q in reversed(trail[:5]):
+                    if 1.2<distance(pos,q)<18 and self.world.ground_segment(pos,q,*self.body):
+                        return q
         return goal

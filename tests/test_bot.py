@@ -5,6 +5,7 @@ import json
 import math
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -104,6 +105,19 @@ class GeometryTests(unittest.TestCase):
         self.assertIsNotNone(w.motion([0,0,15],[5,0],2.5,9))
         self.assertIsNotNone(w.motion([8,0,15],[16,0],2.5,9))
 
+    def test_route_does_not_skip_occluded_corner(self):
+        w=toy_world([prism(-1,-20,1,20)])
+        nav=Navigator(w)
+        goal=(4,-24)
+        nav.waypoint((-4,-24,0),goal,2.5,9,50,0)
+        nav.goal=goal
+        nav.path=[(-4,-24),goal]
+        pos=(-4,-21,0)
+        self.assertFalse(w.ground_segment(pos,goal,2.5,9))
+        waypoint=nav.waypoint(pos,goal,2.5,9,50,0.1)
+        self.assertTrue(w.ground_segment(pos,waypoint,2.5,9))
+        self.assertEqual(waypoint,(-4,-24))
+
 
 class CombatTests(unittest.TestCase):
     def setUp(self):
@@ -146,6 +160,28 @@ class CombatTests(unittest.TestCase):
         self.obs['self']['weapons'][1]['charge']=0.75
         self.assertFalse(self.combat.command(self.obs,e,True,0)['fire'][1])
 
+    def test_gun_keeps_firing_during_early_laser_charge(self):
+        e=enemy(80);e['vel']=[0,12,0]
+        me=self.obs['self']
+        me['weapons'][1]=laser(0.3)
+        lead=intercept([0,0,7],center(e),e['vel'],252)
+        me['aim']=aim_at([0,0,7],lead)
+        action=self.combat.command(self.obs,e,True,0)
+        self.assertEqual(action['fire'],[True,True])
+
+    def test_retreat_does_not_start_laser_charge(self):
+        e=enemy(80)
+        me=self.obs['self']
+        me['weapons'][1]=laser()
+        me['aim']=aim_at([0,0,7],center(e))
+        action=self.combat.command(self.obs,e,True,0,mobile=True)
+        self.assertEqual(action['fire'],[True,False])
+
+    def test_retreat_releases_existing_charge(self):
+        e=enemy(80)
+        self.obs['self']['weapons'][1]=laser(0.3)
+        self.assertFalse(self.combat.command(self.obs,e,True,0,mobile=True)['fire'][1])
+
     def test_lightning_preserves_escape_energy(self):
         e=enemy(30)
         me=self.obs['self']
@@ -167,13 +203,71 @@ class PolicyTests(unittest.TestCase):
         self.obs['self']['pos']=[0,0,0]
         self.obs['zone'].update(center=[0,0],next_center=[0,0],radius=90,next_radius=80)
 
-    def test_low_health_does_not_keep_firing(self):
+    def test_low_health_quiet_recovery_does_not_keep_firing(self):
         self.obs['self']['hp']=350
-        self.obs['mechs']=[enemy()]
+        self.obs['mechs']=[enemy(90)]
+        self.obs['self']['aim']=aim_at([0,0,7],center(self.obs['mechs'][0]))
         action=self.bot.act(self.obs)
         self.assertEqual(self.bot.mode,'ESCAPE')
         self.assertEqual(action['fire'],[False,False])
         self.assertAlmostEqual(action['aim'][0],0)
+
+    def test_healthy_retreat_returns_fire(self):
+        self.obs['mechs']=[enemy(),dict(enemy(60,10),id=6)]
+        self.obs['self']['aim']=aim_at([0,0,7],center(self.obs['mechs'][0]))
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'ESCAPE')
+        self.assertTrue(a['fire'][0])
+
+    def test_low_health_under_attack_returns_fire_then_goes_quiet(self):
+        self.obs['self']['hp']=350
+        self.obs['mechs']=[enemy(90)]
+        self.obs['self']['aim']=aim_at([0,0,7],center(self.obs['mechs'][0]))
+        self.obs['events']=[{'type':'damaged','amount':45,'weapon':'gun','by':5,'bearing':0}]
+        self.assertTrue(self.bot.act(self.obs)['fire'][0])
+        self.obs['events']=[]
+        self.obs['t']=2
+        self.obs['tick']=40
+        self.assertFalse(self.bot.act(self.obs)['fire'][0])
+
+    def test_empty_safe_area_is_explored(self):
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'COLLECT')
+        self.assertGreater(distance(self.bot.goal,self.obs['self']['pos']),10)
+        self.assertGreater(math.hypot(*a['move']),0)
+
+    def test_nearby_weapon_is_collected_during_distant_fight(self):
+        self.obs['mechs']=[enemy(80)]
+        self.obs['pickups']=[{'id':8000,'kind':'lightning','pos':[-10,0,0]}]
+        self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'FIGHT')
+        self.assertEqual(list(self.bot.goal),[-10,0])
+
+    def test_controller_slows_to_reach_wall_side_waypoint(self):
+        self.bot.world=toy_world([prism(0,-30,20,30)])
+        self.obs['self']['pos']=[-6,0,0]
+        self.bot.deadline=time.perf_counter()+1
+        self.bot.mode='COLLECT'
+        a=self.bot.steer(self.obs,(-3,0),[])
+        self.assertGreater(a['move'][0],0)
+        self.assertLess(a['move'][0],1)
+        self.assertAlmostEqual(a['move'][1],0)
+
+    def test_zero_motion_with_distant_goal_triggers_recovery(self):
+        self.bot.steer=lambda *args: {'move':[0,0],'boost':False,'jump':False}
+        for i in range(18):
+            self.obs['t']=i*0.1;self.obs['tick']=i*2
+            self.bot.act(self.obs)
+        self.assertGreater(self.bot.last_reset,0)
+
+    def test_does_not_reload_just_because_aim_is_turning(self):
+        self.obs['zone'].update(radius=300,next_radius=250)
+        self.obs['mechs']=[enemy(150)]
+        self.obs['self']['weapons'][0]['ammo']=6
+        self.obs['self']['aim']=[math.pi,0]
+        a=self.bot.act(self.obs)
+        self.assertFalse(a['fire'][0])
+        self.assertFalse(a['reload'])
 
     def test_zone_escape_takes_priority_over_loot(self):
         self.obs['self']['pos']=[95,0,0]

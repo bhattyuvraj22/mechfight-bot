@@ -1,4 +1,4 @@
-"""Oval Sentinel v0.1: a deterministic, survival-oriented mechfight/1 bot."""
+"""Oval Sentinel v0.2: mobile return fire, resource seeking and corner handling."""
 import math
 import time
 from collections import deque
@@ -10,7 +10,7 @@ from navigation import Navigator
 
 
 class Bot:
-    name='Oval-Sentinel-v0.1'
+    name='Oval-Sentinel-v0.2'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -29,6 +29,14 @@ class Bot:
         self.last_reset=-100
         self.last_damage=-100
         self.items={}
+        self.visited={}
+        self.explore_goal=None
+        self.explore_until=-1
+        self.last_self_hp=None
+        self.damage_bearing=None
+        self.damage_bearing_at=-100
+        self.failed_goals={}
+        self.last_waypoint=None
 
     def stat(self,me,key,default):
         return me['stats'].get(key,self.config['mech'].get(key,default))
@@ -54,13 +62,13 @@ class Bot:
     def threat_list(self,obs):
         me=obs['self']
         result=[]
-        eye=[*me['pos'][:2],me['pos'][2]+self.stat(me,'eye_height',8)]
+        muzzle=[*me['pos'][:2],me['pos'][2]+self.stat(me,'muzzle_height',7)]
         actors=sorted(obs['mechs'],key=lambda e:distance(me['pos'],e['pos']))[:16]
         for e in actors:
             d=distance(me['pos'],e['pos'])
             if d>300:
                 continue
-            exposed=self.world.ray_clear(eye,center(e))
+            exposed=self.world.ray_clear(muzzle,center(e))
             # NPCs are locally dangerous but are not placement targets.
             if e['kind']=='npc' and d>60:
                 continue
@@ -74,9 +82,9 @@ class Bot:
         def score(t):
             e=t['actor']
             hp=e.get('hp',1400)
-            return (t['dist']*0.65+hp*0.025+(40 if e['kind']=='npc' else 0)
-                    -(14 if e['id']==self.target_id else 0)
-                    -(60 if hp<180 else 0))
+            return (t['dist']*0.45+hp*0.045+(65 if e['kind']=='npc' else 0)
+                    -(30 if e['id']==self.target_id else 0)
+                    -(85 if hp<220 else 0))
         target=min(candidates,key=score)['actor']
         self.target_id=target['id']
         return target
@@ -115,7 +123,83 @@ class Bot:
         dx,dy=unit(me['pos'][0]-c[0],me['pos'][1]-c[1])
         # Prefer the nearer side of the next circle, but with room to retreat.
         r=min(distance(me['pos'],c),max(0,z['next_radius']*0.55-12))
-        return c[0]+r*dx,c[1]+r*dy
+        q=c[0]+r*dx,c[1]+r*dy
+        return self.walkable_goal(q,me)
+
+    def walkable_goal(self,q,me):
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        if self.world.ground_free(*q,r+0.3,h):
+            return q
+        # A zone centre / combat range point can fall inside a solid building.
+        # Find a usable nearby ground destination before asking A* to route there.
+        for radius in (8,16,28,44):
+            points=[(q[0]+radius*math.cos(i*math.pi/4),q[1]+radius*math.sin(i*math.pi/4)) for i in range(8)]
+            for p in sorted(points,key=lambda p:distance(me['pos'],p)):
+                if self.world.ground_free(*p,r+0.3,h):
+                    return p
+        return tuple(me['pos'][:2])
+
+    @staticmethod
+    def cell(p):
+        return math.floor(p[0]/24),math.floor(p[1]/24)
+
+    def loot_goal(self,obs,threats,near_only=False):
+        me=obs['self'];pos=me['pos'];now=obs['t']
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        has_secondary=any(w and w['kind']!='gun' for w in me['weapons'])
+        choices=[]
+        for _,(kind,item,seen) in self.items.items():
+            p=item['pos'];d=distance(pos,p)
+            if d>(18 if near_only else 100) or abs(pos[2]-p[2])>4 or self.zone_cost(obs,p,12)>0:
+                continue
+            if self.failed_goals.get(self.cell(p),-1)>now:
+                continue
+            if kind=='pickups' and (has_secondary or item['kind'] not in ('laser','lightning')):
+                continue
+            if kind=='crates' and (near_only or me['hp']<0.9*me['max_hp'] or threats):
+                continue
+            dangerous=False
+            for t in threats[:4]:
+                # A short detour away from a distant attacker can still equip us.
+                enemy_distance=distance(p,t['actor']['pos'])
+                if enemy_distance<45 or (t['exposed'] and enemy_distance<t['dist']-5):
+                    dangerous=True
+                    break
+            if dangerous or not self.world.ground_free(*p[:2],r+0.3,h):
+                continue
+            if near_only and not self.world.ground_segment(pos,p,r+0.3,h):
+                continue
+            bonus={'cubes':40,'pickups':55,'crates':12}[kind]
+            choices.append((d-bonus+(now-seen)*2,p[:2]))
+        return min(choices,key=lambda it:it[0])[1] if choices else None
+
+    def explore(self,obs,threats):
+        now=obs['t'];me=obs['self'];pos=me['pos']
+        if (self.explore_goal is not None and now<self.explore_until
+                and distance(pos,self.explore_goal)>5 and self.zone_cost(obs,self.explore_goal,10)<1
+                and self.failed_goals.get(self.cell(self.explore_goal),-1)<=now):
+            return self.explore_goal
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        candidates=[]
+        for i in range(12):
+            angle=i*math.pi/6+self.slot*0.37
+            q=pos[0]+42*math.cos(angle),pos[1]+42*math.sin(angle)
+            if self.zone_cost(obs,q,12)>0 or self.failed_goals.get(self.cell(q),-1)>now:
+                continue
+            if not self.world.ground_free(*q,r+0.3,h):
+                continue
+            age=now-self.visited.get(self.cell(q),-1000)
+            score=max(0,60-age)*1.2
+            if not self.world.ground_segment(pos,q,r+0.3,h):
+                score+=15
+            score+=sum(max(0,100-distance(q,t['actor']['pos'])) for t in threats[:3])
+            # Prefer space towards the next safe area, without treating the
+            # current position as the final destination of resource collection.
+            score+=distance(q,obs['zone']['next_center'])*0.03
+            candidates.append((score,q))
+        self.explore_goal=min(candidates,key=lambda it:it[0])[1] if candidates else self.safe_anchor(obs)
+        self.explore_until=now+6
+        return self.explore_goal
 
     def exposure(self,p,threats,height):
         value=0
@@ -136,38 +220,25 @@ class Bot:
         height=self.stat(me,'height',9)
         anchor=self.safe_anchor(obs)
         if self.mode=='FIGHT' and target:
+            loot=self.loot_goal(obs,threats,near_only=True)
+            if loot is not None:
+                return loot
             dx,dy=unit(pos[0]-target['pos'][0],pos[1]-target['pos'][1])
             kinds=[w['kind'] for w in me['weapons'] if w]
             preferred=105 if 'laser' in kinds else 85
             if 'lightning' in kinds and me['energy']>55 and distance(pos,target['pos'])<55:
                 preferred=34
-            q=target['pos'][0]+dx*preferred,target['pos'][1]+dy*preferred
+            q=self.walkable_goal((target['pos'][0]+dx*preferred,target['pos'][1]+dy*preferred),me)
             # Never pursue a preferred range into the storm.
             if self.zone_cost(obs,q,6)<3:
                 return q
             return anchor
         if self.mode=='COLLECT':
-            options=[]
-            has_secondary=any(w and w['kind']!='gun' for w in me['weapons'])
-            for _,(kind,item,seen) in self.items.items():
-                d=distance(pos,item['pos'])
-                if d>70 or abs(pos[2]-item['pos'][2])>4 or self.zone_cost(obs,item['pos'],12)>0:
-                    continue
-                if kind=='pickups' and (has_secondary or item['kind'] not in ('laser','lightning')):
-                    continue
-                if kind=='crates' and me['hp']<0.88*me['max_hp']:
-                    continue
-                if any(distance(item['pos'],t['actor']['pos'])<65 for t in threats):
-                    continue
-                if not self.world.ground_free(*item['pos'][:2],radius+0.3,height):
-                    continue
-                bonus={'cubes':38,'pickups':32,'crates':10}[kind]
-                options.append((d-bonus+(obs['t']-seen)*2,item['pos'][:2]))
-            if options:
-                return min(options,key=lambda t:t[0])[1]
+            loot=self.loot_goal(obs,threats)
+            return loot if loot is not None else self.explore(obs,threats)
         if self.mode in ('ESCAPE','HEAL','ROTATE'):
             deadline=min(self.deadline-0.012,time.perf_counter()+0.007)
-            points=self.world.cover_points(pos,radius)+[anchor,tuple(pos[:2])]
+            points=[anchor,tuple(pos[:2])]+self.world.cover_points(pos,radius)
             points.extend((pos[0]+24*math.cos(i*math.pi/4),pos[1]+24*math.sin(i*math.pi/4)) for i in range(8))
             candidates=[]
             for q in points:
@@ -175,9 +246,13 @@ class Bot:
                     break
                 if not self.world.ground_free(*q,radius+0.3,height):
                     continue
+                if self.failed_goals.get(self.cell(q),-1)>obs['t']:
+                    continue
                 p=[*q,self.world.height(*q)]
                 travel=distance(pos,q)
                 score=travel*0.4+self.zone_cost(obs,q,max(8,travel/8))*14
+                if not self.world.ground_segment(pos,q,radius+0.3,height):
+                    score+=12  # A nearby point behind a wall may need a long detour.
                 if self.mode=='ROTATE':
                     score+=distance(q,anchor)*1.8
                 score+=self.exposure(p,threats,height)*1.8
@@ -224,7 +299,16 @@ class Bot:
         if any(w and w['kind']=='laser' and w.get('charge',0)>0 for w in me['weapons']):
             speed*=self.stat(me,'charge_move_mult',0.5)
         desired=unit(waypoint[0]-pos[0],waypoint[1]-pos[1])
-        choices=[desired]+[(math.cos(i*math.pi/8),math.sin(i*math.pi/8)) for i in range(16)]+[(0,0)]
+        approach=min(1,distance(pos,waypoint)/max(1,speed*0.6))
+        # Full-speed-only rollouts reject a perfectly valid short approach to a
+        # corner because they continue into the wall beyond it. Partial inputs
+        # let us brake and reach the turning point instead of stopping early.
+        choices=[(desired[0]*approach,desired[1]*approach),desired,(0,0)]
+        for i in range(16):
+            direction=(math.cos(i*math.pi/8),math.sin(i*math.pi/8))
+            choices.append(direction)
+            if i%2==0:
+                choices.append((direction[0]*0.4,direction[1]*0.4))
         best=(float('inf'),(0,0))
         urgency=1.5 if self.mode=='ROTATE' else 1.0
         for direction in choices:
@@ -238,7 +322,7 @@ class Bot:
                 acc=self.stat(me,'ground_accel' if me['grounded'] else 'air_accel',58.5 if me['grounded'] else 12)*0.2
                 factor=min(1,acc/(math.hypot(ax,ay) or 1))
                 vx,vy=vx+ax*factor,vy+ay*factor
-                p=self.world.motion(p,(p[0]+vx*0.2,p[1]+vy*0.2),r+0.15,h,
+                p=self.world.motion(p,(p[0]+vx*0.2,p[1]+vy*0.2),r,h,
                                     self.stat(me,'step_up',1.2),self.stat(me,'max_slope_deg',50))
                 if p is None:
                     valid=False
@@ -269,6 +353,18 @@ class Bot:
                 best=score,direction
         return {'move':list(best[1]),'boost':bool(boost and best[1]!=(0,0)),'jump':False}
 
+    def should_fire(self,obs,target):
+        if target is None or target.get('kind') not in ('mech','npc'):
+            return False
+        if not self.healing and self.mode!='HEAL':
+            return True
+        me=obs['self']
+        # No healing can occur while storm damage keeps resetting the timer.
+        # Return fire under continuing attack, but stop after breaking contact
+        # so healing can actually start. Very close enemies merit self-defence.
+        return (not me['in_zone'] or obs['t']-self.last_damage<1.2
+                or distance(me['pos'],target['pos'])<45)
+
     def act(self,obs):
         # Reserve ~20 ms of the server's budget for transport, scheduling, and
         # machine variance. Expensive search/steering loops stop with a usable
@@ -278,8 +374,16 @@ class Bot:
         now=obs['t']
         pos=me['pos']
         self.update_items(obs)
-        if any(e['type']=='damaged' for e in obs.get('events',[])):
+        self.visited[self.cell(pos)]=now
+        self.failed_goals={k:v for k,v in self.failed_goals.items() if v>now}
+        if (any(e['type']=='damaged' for e in obs.get('events',[])) or
+                (self.last_self_hp is not None and me['hp']<self.last_self_hp)):
             self.last_damage=now
+        self.last_self_hp=me['hp']
+        damage=next((e for e in reversed(obs.get('events',[])) if e['type']=='damaged' and e.get('bearing') is not None),None)
+        if damage:
+            self.damage_bearing=damage['bearing']
+            self.damage_bearing_at=now
         hp=me['hp']/max(1,me['max_hp'])
         if hp<0.53:
             self.healing=True
@@ -312,8 +416,10 @@ class Bot:
         # Keep the goal stable between strategic updates so A* can finish.
         waypoint=self.nav.waypoint(pos,self.goal,self.stat(me,'radius',2.5),self.stat(me,'height',9),
                                    self.stat(me,'max_slope_deg',50),now)
+        self.last_waypoint=waypoint
         action=self.steer(obs,waypoint,threats)
-        self.history.append((now,tuple(pos[:2]),math.hypot(*action['move'])))
+        wants_progress=distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
+        self.history.append((now,tuple(pos[:2]),float(wants_progress)))
         while self.history and now-self.history[0][0]>1.5:
             self.history.popleft()
         if self.history and now-self.history[0][0]>1.2 and now-self.last_reset>2:
@@ -322,16 +428,17 @@ class Bot:
                 self.recover_until=now+1.2
                 self.last_reset=now
                 self.goal_at=-100
+                self.failed_goals[self.cell(self.goal)]=now+5
+                self.explore_until=-1
         facing=target or (threats[0]['actor'] if threats else None)
         if facing is not None:
             yaw=math.atan2(facing['pos'][1]-pos[1],facing['pos'][0]-pos[0])
         else:
             # Torso-only scan; movement does not depend on the look direction.
             yaw=(now*0.9+self.slot*0.7+math.pi)%(2*math.pi)-math.pi
-            damage=next((e for e in reversed(obs.get('events',[])) if e['type']=='damaged' and e.get('bearing') is not None),None)
-            if damage:
-                yaw=damage['bearing']
-        allow_fire=self.mode in ('FIGHT','ROTATE') and not self.healing
+            if self.damage_bearing is not None and now-self.damage_bearing_at<2:
+                yaw=self.damage_bearing
+        allow_fire=self.should_fire(obs,target)
         # Shoot a nearby visible crate only when healthy and unthreatened. Never
         # use remembered crates for firing: they may already have been destroyed.
         if self.mode=='COLLECT' and not threats and hp>0.88:
@@ -341,12 +448,13 @@ class Bot:
                 allow_fire=True
         if target is None and facing is not None:
             target=facing
-        action.update(self.combat.command(obs,target,allow_fire,yaw))
+        action.update(self.combat.command(obs,target,allow_fire,yaw,
+                                         mobile=self.mode in ('ESCAPE','ROTATE') or action['boost']))
         # Reload early while safe, rather than entering a fight with two rounds.
         gun=next((w for w in me['weapons'] if w and w['kind']=='gun'),None)
         if gun and gun.get('reload',0)<=0:
             action['reload']=(gun.get('ammo',0)==0 or
-                              (not any(action['fire']) and not close and gun.get('ammo',0)<gun['stats']['mag']*0.65))
+                              (not any(action['fire']) and not exposed and gun.get('ammo',0)<gun['stats']['mag']*0.65))
         if any(w is None for w in me['weapons']):
             reach=self.config['loot']['pickup_radius']
             pickups=[p for p in obs.get('pickups',[]) if p['kind'] in ('laser','lightning')

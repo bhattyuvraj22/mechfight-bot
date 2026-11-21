@@ -44,7 +44,7 @@ class Combat:
     def __init__(self,world):
         self.world=world
 
-    def command(self,obs,target,allow_fire,default_yaw,reserve=28):
+    def command(self,obs,target,allow_fire,default_yaw,reserve=28,mobile=False):
         me=obs['self']
         stats=me['stats']
         origin=[*me['pos'][:2],me['pos'][2]+stats.get('muzzle_height',7)]
@@ -65,12 +65,18 @@ class Combat:
         laser_idx=next((i for i,w in enumerate(weapons) if w and w['kind']=='laser'),None)
         gun_idx=next((i for i,w in enumerate(weapons) if w and w['kind']=='gun'),None)
         laser=weapons[laser_idx] if laser_idx is not None else None
-        # Charge only when fighting at range; don't slow down to charge on escape.
-        laser_active=laser is not None and (laser.get('charge',0)>0 or (laser['cooldown']<=0 and 50<dist<laser['stats']['range']))
+        # Returning fire while escaping must not initiate a movement-slowing
+        # charge. An existing charge is released promptly to regain mobility.
+        laser_active=laser is not None and (laser.get('charge',0)>0 or
+                     (not mobile and laser['cooldown']<=0 and 50<dist<laser['stats']['range']))
         if gun_idx is not None:
             gun=weapons[gun_idx]
             gun_point=intercept(origin,pt,vel,gun['stats']['speed'])
-        point=pt if laser_active or gun_point is None else gun_point
+        # Keep leading the gun during most of the charge. Only transfer the
+        # shared torso to hitscan aim just before releasing the laser.
+        laser_aim=(laser_active and laser.get('charge',0)>0 and
+                   (mobile or laser.get('charge',0)>=laser['stats']['charge']-0.1))
+        point=pt if laser_aim or gun_point is None else gun_point
         desired=aim_at(origin,point)
         out['aim']=[desired[0],clamp(desired[1],stats.get('min_pitch',-0.7),stats.get('max_pitch',1.3))]
         for i,w in enumerate(weapons):
@@ -92,7 +98,7 @@ class Combat:
                 if charge>0:
                     # False releases. Wait for full charge and an aligned shot,
                     # unless holding longer would hit the server's auto-fire cap.
-                    release=charge>=ws['charge'] and aligned(me['aim'],aim_at(origin,pt),tr,dist) and clear
+                    release=mobile or (charge>=ws['charge'] and aligned(me['aim'],aim_at(origin,pt),tr,dist) and clear)
                     out['fire'][i]=not release
                 elif laser_active and clear and w['cooldown']<=0:
                     out['fire'][i]=True
