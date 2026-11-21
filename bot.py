@@ -1,4 +1,4 @@
-"""Oval Sentinel v0.2: mobile return fire, resource seeking and corner handling."""
+"""Oval Sentinel v0.3: ranged escape, equipment priority and guarded recovery."""
 import math
 import time
 from collections import deque
@@ -10,7 +10,7 @@ from navigation import Navigator
 
 
 class Bot:
-    name='Oval-Sentinel-v0.2'
+    name='Oval-Sentinel-v0.3'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -37,6 +37,9 @@ class Bot:
         self.damage_bearing_at=-100
         self.failed_goals={}
         self.last_waypoint=None
+        self.boosting=False
+        self.equip_goal=None
+        self.selected_drop=None
 
     def stat(self,me,key,default):
         return me['stats'].get(key,self.config['mech'].get(key,default))
@@ -143,12 +146,14 @@ class Bot:
     def cell(p):
         return math.floor(p[0]/24),math.floor(p[1]/24)
 
-    def loot_goal(self,obs,threats,near_only=False):
+    def loot_goal(self,obs,threats,near_only=False,weapons_only=False):
         me=obs['self'];pos=me['pos'];now=obs['t']
         r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
         has_secondary=any(w and w['kind']!='gun' for w in me['weapons'])
         choices=[]
         for _,(kind,item,seen) in self.items.items():
+            if weapons_only and kind!='pickups':
+                continue
             p=item['pos'];d=distance(pos,p)
             if d>(18 if near_only else 100) or abs(pos[2]-p[2])>4 or self.zone_cost(obs,p,12)>0:
                 continue
@@ -172,6 +177,73 @@ class Bot:
             bonus={'cubes':40,'pickups':55,'crates':12}[kind]
             choices.append((d-bonus+(now-seen)*2,p[:2]))
         return min(choices,key=lambda it:it[0])[1] if choices else None
+
+    def enemy_reach(self,actor):
+        """Estimate from visible loadout and live config; enemy upgrades unknown."""
+        if actor['kind']=='npc':
+            return 60
+        ranges=[]
+        for kind in actor.get('weapons',['gun']):
+            s=self.config['weapons'].get(kind,{})
+            reach=s.get('range')
+            if reach is None and kind=='mortar':
+                reach=s.get('speed',72)**2/max(1,s.get('gravity',22))
+            if reach is not None:
+                ranges.append(reach)
+        return max(ranges,default=230)+15
+
+    def safe_drop(self,obs,threats):
+        """Only approach landed drops with a short clear route and time margin.
+
+        Hidden enemies are still possible: this is a risk filter, not a guarantee.
+        Do not camp waiting for a landing or attempt a contested capture.
+        """
+        me=obs['self'];pos=me['pos']
+        if obs['t']-self.last_damage<2:
+            return None
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        options=[]
+        for drop in obs.get('drops',[]):
+            p=drop['pos'];d=distance(pos,p)
+            if drop['lands_in']>0 or d>55 or abs(pos[2]-p[2])>4:
+                continue
+            if drop.get('holder') not in (None,me['id']):
+                continue
+            progress=drop.get('progress',0) if drop.get('holder')==me['id'] else 0
+            # Full path-to-centre time is conservative; capture starts in the ring.
+            eta=d/max(1,self.stat(me,'walk_speed',11.7))
+            capture=max(0,drop['capture_s']-progress)
+            horizon=eta+capture+3
+            if self.zone_cost(obs,p,horizon)>0 or not self.world.ground_segment(pos,p,r+0.3,h):
+                continue
+            risk=False
+            for t in threats:
+                e=t['actor'];ed=distance(p,e['pos'])
+                if e['kind']=='npc':
+                    risk |= ed<65
+                else:
+                    # Even remembered opponents behind walls may rush the ring.
+                    arrival=max(0,ed-drop['radius'])/(self.config['mech'].get('boost_speed',19.5)*1.25)
+                    risk |= arrival<horizon or (t['exposed'] and ed<self.enemy_reach(e))
+            if not risk:
+                options.append((d-5*progress,drop))
+        return min(options,key=lambda item:item[0])[1] if options else None
+
+    def needs_reload_cover(self,obs,target):
+        if target is None:
+            return False
+        me=obs['self'];d=distance(me['pos'],target['pos'])
+        gun=next((w for w in me['weapons'] if w and w['kind']=='gun'),None)
+        if not gun or (gun.get('ammo',0)>0 and gun.get('reload',0)<=0):
+            return False
+        for w in me['weapons']:
+            if not w or w['kind']=='gun' or w['cooldown']>0.15:
+                continue
+            if w['kind']=='laser' and 50<d<w['stats']['range']:
+                return False
+            if w['kind']=='lightning' and d<w['stats']['range'] and me['energy']>32:
+                return False
+        return d<self.enemy_reach(target)
 
     def explore(self,obs,threats):
         now=obs['t'];me=obs['self'];pos=me['pos']
@@ -210,7 +282,10 @@ class Bot:
             origin[2]+=2
             if self.world.ray_clear(origin,[p[0],p[1],p[2]+height*0.5]):
                 weight=0.5 if e['kind']=='npc' else 1
-                value+=weight*(25+max(0,140-d)*0.55)
+                reach=self.enemy_reach(e)
+                # No flat plateau inside a gun/laser's firing range. A retreat
+                # should still make progress at 170 m, not stop in the open.
+                value+=weight*(max(0,reach-d)*0.55+(25 if d<reach else 0))
         return value
 
     def choose_goal(self,obs,threats,target):
@@ -219,6 +294,13 @@ class Bot:
         radius=self.stat(me,'radius',2.5)
         height=self.stat(me,'height',9)
         anchor=self.safe_anchor(obs)
+        if self.mode=='EQUIP' and self.equip_goal is not None:
+            return self.equip_goal
+        if self.mode=='CAPTURE' and self.selected_drop is not None:
+            drop=self.selected_drop
+            if distance(pos,drop['pos'])<max(1,drop['radius']-3):
+                return tuple(pos[:2])
+            return tuple(drop['pos'][:2])
         if self.mode=='FIGHT' and target:
             loot=self.loot_goal(obs,threats,near_only=True)
             if loot is not None:
@@ -236,9 +318,17 @@ class Bot:
         if self.mode=='COLLECT':
             loot=self.loot_goal(obs,threats)
             return loot if loot is not None else self.explore(obs,threats)
-        if self.mode in ('ESCAPE','HEAL','ROTATE'):
+        if self.mode in ('ESCAPE','HEAL','ROTATE','RELOAD'):
             deadline=min(self.deadline-0.012,time.perf_counter()+0.007)
-            points=[anchor,tuple(pos[:2])]+self.world.cover_points(pos,radius)
+            # Evaluate one direct retreat candidate before the larger cover list,
+            # so a tight computation budget does not leave only 'stay here'.
+            away=(0,0)
+            for t in threats[:3]:
+                dx,dy=unit(pos[0]-t['actor']['pos'][0],pos[1]-t['actor']['pos'][1])
+                away=(away[0]+dx/max(20,t['dist']),away[1]+dy/max(20,t['dist']))
+            ux,uy=unit(*away)
+            retreat=(pos[0]+42*ux,pos[1]+42*uy)
+            points=[retreat,anchor,tuple(pos[:2])]+self.world.cover_points(pos,radius)
             points.extend((pos[0]+24*math.cos(i*math.pi/4),pos[1]+24*math.sin(i*math.pi/4)) for i in range(8))
             candidates=[]
             for q in points:
@@ -256,7 +346,7 @@ class Bot:
                 if self.mode=='ROTATE':
                     score+=distance(q,anchor)*1.8
                 score+=self.exposure(p,threats,height)*1.8
-                if self.mode=='ESCAPE':
+                if self.mode in ('ESCAPE','RELOAD'):
                     score+=sum(max(0,75-distance(q,t['actor']['pos'])) for t in threats[:3])
                 if self.goal is not None:
                     score+=min(10,distance(q,self.goal)*0.2)
@@ -292,9 +382,18 @@ class Bot:
         pos=me['pos']
         r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
         near=min((t['dist'] for t in threats if t['exposed']),default=999)
-        boost=(me['grounded'] and me['energy']>32 and
-               (not me['in_zone'] or (self.mode=='ESCAPE' and near<105) or
-                (self.mode=='ROTATE' and self.zone_cost(obs,pos,4)>0)))
+        urgent_boost=(not me['in_zone'] or (self.mode=='ROTATE' and self.zone_cost(obs,pos,4)>0))
+        escape_boost=(self.mode=='ESCAPE' and any(t['exposed'] and t['dist']<self.enemy_reach(t['actor']) for t in threats)
+                      and (near<105 or me['hp']<0.55*me['max_hp'] or obs['t']-self.last_damage<2.5))
+        equip_boost=self.mode=='EQUIP' and near>115 and distance(pos,waypoint)>16
+        wanted=urgent_boost or escape_boost or equip_boost
+        # Recharge in a useful block. A single 32-energy threshold flickered
+        # boost on/off and repeatedly restarted the energy regeneration delay.
+        threshold=22 if self.boosting else 58
+        if urgent_boost:
+            threshold=8
+        boost=bool(me['grounded'] and wanted and me['energy']>threshold)
+        self.boosting=boost
         speed=self.stat(me,'boost_speed' if boost else 'walk_speed',19.5 if boost else 11.7)
         if any(w and w['kind']=='laser' and w.get('charge',0)>0 for w in me['weapons']):
             speed*=self.stat(me,'charge_move_mult',0.5)
@@ -336,9 +435,9 @@ class Bot:
                 d=distance(p,e['pos'])
                 if d<r+3:
                     score+=100
-                if self.mode in ('ESCAPE','HEAL'):
+                if self.mode in ('ESCAPE','HEAL','RELOAD'):
                     score+=max(0,70-d)*0.65
-            if self.mode in ('ESCAPE','HEAL') and threats:
+            if self.mode in ('ESCAPE','HEAL','RELOAD') and threats:
                 score+=self.exposure(p,threats[:2],h)*0.45
             if self.mode=='FIGHT' and threats:
                 # A small alternating strafe preference at useful shooting range.
@@ -397,12 +496,23 @@ class Bot:
         travel=max(0,distance(pos,z['next_center'])-max(0,z['next_radius']-18))*1.6/max(1,self.stat(me,'walk_speed',11.7))
         urgent=(not me['in_zone'] or self.zone_cost(obs,pos,3)>0 or
                 (travel>0 and z['shrink_end']-now<travel+12))
+        self.selected_drop=self.safe_drop(obs,threats) if not urgent else None
+        has_secondary=any(w and w['kind']!='gun' for w in me['weapons'])
+        distant_contact=not exposed or min(t['dist'] for t in exposed)>115
+        self.equip_goal=(self.loot_goal(obs,threats,weapons_only=True)
+                         if not urgent and not has_secondary and hp>0.6 and distant_contact else None)
         if urgent:
             self.mode='ROTATE'
+        elif self.selected_drop is not None:
+            self.mode='CAPTURE'
         elif self.healing:
             self.mode='ESCAPE' if exposed else 'HEAL'
         elif len(close)>=2:
             self.mode='ESCAPE'
+        elif self.equip_goal is not None:
+            self.mode='EQUIP'
+        elif self.needs_reload_cover(obs,target):
+            self.mode='RELOAD'
         elif target is not None:
             self.mode='FIGHT'
         elif hp<0.88:
@@ -449,7 +559,7 @@ class Bot:
         if target is None and facing is not None:
             target=facing
         action.update(self.combat.command(obs,target,allow_fire,yaw,
-                                         mobile=self.mode in ('ESCAPE','ROTATE') or action['boost']))
+                                         mobile=self.mode in ('ESCAPE','ROTATE','RELOAD','EQUIP') or action['boost']))
         # Reload early while safe, rather than entering a fight with two rounds.
         gun=next((w for w in me['weapons'] if w and w['kind']=='gun'),None)
         if gun and gun.get('reload',0)<=0:

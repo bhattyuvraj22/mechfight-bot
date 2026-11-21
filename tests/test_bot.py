@@ -59,6 +59,11 @@ def laser(charge=0):
             'stats':{'charge':0.75,'range':280,'hold_s':2,'damage':315}}
 
 
+def drop_at(x=20,y=0,holder=None,progress=0):
+    return {'id':20000,'pos':[x,y,0],'radius':8,'lands_in':0,
+            'capture_s':4,'progress':progress,'holder':holder}
+
+
 class GeometryTests(unittest.TestCase):
     def test_wall_blocks_shots_but_not_over_roof(self):
         w=toy_world([prism(0,-8,1,8)])
@@ -268,6 +273,101 @@ class PolicyTests(unittest.TestCase):
         a=self.bot.act(self.obs)
         self.assertFalse(a['fire'][0])
         self.assertFalse(a['reload'])
+
+    def test_ranged_escape_keeps_moving_out_of_open_fire(self):
+        self.obs['zone'].update(radius=400,next_radius=300)
+        self.obs['self']['hp']=350
+        self.obs['mechs']=[enemy(170)]
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'ESCAPE')
+        self.assertLess(self.bot.goal[0],-10)
+        self.assertLess(a['move'][0],-0.5)
+        self.assertTrue(a['boost'])
+
+    def test_distant_enemy_does_not_override_equipment_acquisition(self):
+        self.obs['zone'].update(radius=400,next_radius=300)
+        self.obs['mechs']=[enemy(170)]
+        self.obs['pickups']=[{'id':8000,'kind':'lightning','pos':[-40,0,0]}]
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'EQUIP')
+        self.assertEqual(list(self.bot.goal),[-40,0])
+        self.assertLess(a['move'][0],0)
+
+    def test_close_enemy_still_takes_priority_over_distant_weapon(self):
+        self.obs['mechs']=[enemy(50)]
+        self.obs['pickups']=[{'id':8000,'kind':'lightning','pos':[-40,0,0]}]
+        self.bot.act(self.obs)
+        self.assertNotEqual(self.bot.mode,'EQUIP')
+
+    def test_boost_recharges_before_restarting(self):
+        b=self.bot;o=self.obs
+        b.mode='ESCAPE';o['self']['hp']=350
+        threat={'actor':enemy(80),'dist':80,'exposed':True}
+        decisions=[]
+        for energy in (100,25,20,35,65):
+            o['self']['energy']=energy;b.deadline=time.perf_counter()+1
+            decisions.append(b.steer(o,(-40,0),[threat])['boost'])
+        self.assertEqual(decisions,[True,True,False,False,True])
+
+    def test_low_health_approaches_uncontested_landed_drop(self):
+        self.obs['self']['hp']=350
+        self.obs['drops']=[drop_at()]
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'CAPTURE')
+        self.assertGreater(a['move'][0],0)
+        self.assertEqual(a['fire'],[False,False])
+
+    def test_capture_holds_position_in_ring(self):
+        self.obs['self']['hp']=350
+        self.obs['drops']=[drop_at(0,holder=self.obs['self']['id'],progress=2)]
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'CAPTURE')
+        self.assertEqual(a['move'],[0.0,0.0])
+
+    def test_does_not_camp_waiting_for_drop_to_land(self):
+        d=drop_at();d['lands_in']=10;self.obs['drops']=[d]
+        self.bot.act(self.obs)
+        self.assertNotEqual(self.bot.mode,'CAPTURE')
+
+    def test_contested_drop_is_rejected(self):
+        self.obs['drops']=[drop_at(holder=5,progress=2)]
+        self.bot.act(self.obs)
+        self.assertNotEqual(self.bot.mode,'CAPTURE')
+
+    def test_exposed_enemy_prevents_capture_even_without_holder(self):
+        self.obs['drops']=[drop_at()]
+        self.obs['mechs']=[enemy(80)]
+        self.bot.act(self.obs)
+        self.assertNotEqual(self.bot.mode,'CAPTURE')
+
+    def test_storm_rotation_overrides_supply_drop(self):
+        self.obs['self']['pos']=[95,0,0]
+        self.obs['self']['in_zone']=False
+        self.obs['drops']=[drop_at(95)]
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'ROTATE')
+        self.assertLess(a['move'][0],0)
+
+    def test_reload_seeks_cover_without_usable_secondary(self):
+        self.obs['mechs']=[enemy(80)]
+        self.obs['self']['weapons'][0].update(ammo=0,reload=2)
+        self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'RELOAD')
+        self.assertLess(self.bot.goal[0],-10)
+
+    def test_usable_laser_allows_fighting_during_gun_reload(self):
+        self.obs['mechs']=[enemy(80)]
+        self.obs['self']['weapons'][0].update(ammo=0,reload=2)
+        self.obs['self']['weapons'][1]=laser()
+        self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'FIGHT')
+
+    def test_exposure_uses_configured_weapon_reach(self):
+        t={'actor':enemy(170),'dist':170,'exposed':True}
+        self.bot.config['weapons']['gun']['range']=100
+        self.assertEqual(self.bot.exposure([0,0,0],[t],9),0)
+        self.bot.config['weapons']['gun']['range']=230
+        self.assertGreater(self.bot.exposure([0,0,0],[t],9),0)
 
     def test_zone_escape_takes_priority_over_loot(self):
         self.obs['self']['pos']=[95,0,0]
