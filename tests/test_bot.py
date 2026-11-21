@@ -230,6 +230,34 @@ class PolicyTests(unittest.TestCase):
         self.obs['tick']=40
         self.assertFalse(self.bot.act(self.obs)['fire'][0])
 
+    def test_wounded_ranged_escape_crosses_incoming_line(self):
+        self.obs['mechs']=[enemy(175)]
+        self.obs['self']['hp']=400
+        self.obs['zone'].update(radius=400,next_radius=300)
+        self.obs['events']=[{'type':'damaged','amount':45,'weapon':'gun','by':5,'bearing':0}]
+        a=self.bot.act(self.obs)
+        self.assertEqual(self.bot.mode,'ESCAPE')
+        self.assertLess(a['move'][0],0)
+        self.assertGreater(abs(a['move'][1]),0.4)
+
+    def test_low_hp_finisher_only_during_regen_delay(self):
+        self.obs['mechs']=[enemy(80,hp=30)]
+        self.obs['self'].update(hp=400,aim=aim_at([0,0,7],center(self.obs['mechs'][0])))
+        self.bot.last_damage=0
+        for t,expected in [(2,True),(6,False)]:
+            self.obs.update(t=t,tick=int(20*t))
+            self.assertEqual(self.bot.act(self.obs)['fire'][0],expected)
+
+    def test_hidden_contact_does_not_override_fresh_damage_direction(self):
+        self.bot.world=toy_world([prism(10,-10,22,10)])
+        self.bot.nav=Navigator(self.bot.world)
+        self.bot.combat=Combat(self.bot.world)
+        self.obs['mechs']=[enemy(40)]
+        self.obs['events']=[{'type':'damaged','amount':45,'weapon':'gun','by':9,'bearing':math.pi}]
+        a=self.bot.act(self.obs)
+        self.assertAlmostEqual(abs(a['aim'][0]),math.pi)
+        self.assertEqual(a['fire'],[False,False])
+
     def test_empty_safe_area_is_explored(self):
         a=self.bot.act(self.obs)
         self.assertEqual(self.bot.mode,'COLLECT')
@@ -290,20 +318,6 @@ class PolicyTests(unittest.TestCase):
         a=self.bot.act(self.obs)
         self.assertEqual(a['pick'],1)
         self.assertEqual(a['take'],8000)
-
-    def test_intact_crate_requires_standoff_but_dropped_cube_does_not(self):
-        self.obs['crates']=[{'id':1000,'pos':[4,0,0],'hp':300}]
-        self.assertLess(self.bot.act(self.obs)['move'][0],0)
-        self.obs.update(t=1,tick=20)
-        me=self.obs['self']
-        me.update(pos=[-9,0,0],aim=aim_at([-9,0,7],[4,0,1]))
-        action=self.bot.act(self.obs)
-        self.assertEqual(action['move'],[0,0])
-        self.assertTrue(action['fire'][0])
-        self.obs.update(crates=[],cubes=[{'id':9000,'pos':[4,0,0]}],t=1.1,tick=22)
-        action=self.bot.act(self.obs)
-        self.assertGreater(action['move'][0],0)
-        self.assertFalse(action['fire'][0])
 
     def test_no_crate_farming_during_recovery(self):
         self.obs['self']['hp']=800
