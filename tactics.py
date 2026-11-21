@@ -7,6 +7,7 @@ while fighting, (3) grow stronger early (drones, drops, sane upgrades).
 """
 import math
 import random
+import time
 
 
 def _clamp(v, lo, hi):
@@ -94,6 +95,7 @@ class Tactics:
         self.headon_votes = 0.0   # bullets aimed where we were
         self.committed = False
         self.ratio = 0.0
+        self.commit_target = None
         self.last_beam = {}       # enemy id -> time its laser last fired
         self.heard = []           # (t, bearing, weight)
 
@@ -161,14 +163,50 @@ class Tactics:
         c = self.config.get('cubes', {})
         return 1 + c.get('damage_per_cube', 0.04) * min(cubes or 0, c.get('stat_cap', 10))
 
-    def my_dps(self, me, dist):
+    def ready_damage(self, me, dist, horizon=2.0, reserve=8):
+        """Conservative damage available before a short engagement ends.
+
+        Do not borrow future energy regeneration or a fresh magazine from beyond
+        the horizon. Opponent readiness is unobserved; enemy_dps stays separate.
+        """
         total = 0.0
         for w in me.get('weapons') or []:
             if not w:
                 continue
-            s = w.get('stats') or {}
-            total += weapon_dps(w['kind'], s) * hit_prob(w['kind'], dist, s.get('range', 45))
-        return total * self.cube_mult(me.get('cubes', 0))
+            kind = w['kind']
+            s = dict(self.config.get('weapons', {}).get(kind, {}))
+            s.update(w.get('stats') or {})
+            if dist > s.get('range', 0):
+                continue
+            cd = max(0.01, s.get('cooldown', 1))
+            delay = max(0.0, w.get('cooldown', 0))
+            if kind == 'gun':
+                delay = max(delay, w.get('reload', 0))
+                delay += dist / max(1, s.get('speed', 252))
+                ammo = s.get('mag', 0) if w.get('reload', 0) > 0 else w.get('ammo', 0)
+                shots = min(ammo, max(0, math.ceil((horizon-delay)/cd)))
+            elif kind == 'laser':
+                delay += max(0, s.get('charge', .75)-w.get('charge', 0))
+                shots = max(0, math.ceil((horizon-delay)/(cd+s.get('charge', .75))))
+            elif kind == 'lightning':
+                shots = min(max(0, math.ceil((horizon-delay)/cd)),
+                            int(max(0, me.get('energy', 0)-reserve)/max(.01, s.get('energy', 3))))
+            else:
+                continue  # command() does not yet aim or fire mortars
+            total += shots*s.get('damage', 0)*hit_prob(kind, dist, s.get('range', 45))
+        return total*self.cube_mult(me.get('cubes', 0))
+
+    def my_dps(self, me, dist):
+        total = 0.0
+        for w in me.get('weapons') or []:
+            if not w or w['kind'] == 'mortar':
+                continue
+            s = dict(self.config.get('weapons', {}).get(w['kind'], {}))
+            s.update(w.get('stats') or {})
+            if dist <= s.get('range', 0):
+                sustained = weapon_dps(w['kind'], s)*hit_prob(w['kind'], dist, s.get('range', 45))*self.cube_mult(me.get('cubes', 0))
+                total += min(sustained, self.ready_damage(dict(me, weapons=[w]), dist)/2)
+        return total
 
     def enemy_dps(self, e, dist):
         base = self.config.get('weapons', {})
@@ -178,30 +216,25 @@ class Tactics:
             total += weapon_dps(kind, s) * hit_prob(kind, dist, s.get('range', 45))
         return total * self.cube_mult(e.get('cubes', 0))
 
-    def evaluate(self, obs, radius=170):
-        """Survive-time / kill-time ratio against nearby mechs (>1 = we win)."""
+    def evaluate(self, obs, radius=170, target=None):
+        """Evaluate the selected, shootable target; never borrow another kill."""
         me = obs['self']
         foes = [m for m in obs.get('mechs', []) if m.get('kind') == 'mech'
                 and _dist2(me['pos'], m['pos']) < radius]
-        if not foes or len(foes) > 2:
-            self.committed = False
-            self.ratio = 0.0
-            return self.ratio
-        armor = _clamp((me.get('stats') or {}).get('armor', 0), 0, 0.9)
-        incoming = sum(self.enemy_dps(m, _dist2(me['pos'], m['pos'])) for m in foes) * (1 - armor)
-        best = None
-        for m in foes:
-            d = _dist2(me['pos'], m['pos'])
-            out = self.my_dps(me, d)
-            if out <= 0:
-                continue
-            t = m.get('hp', m.get('max_hp', 1400)) / out
-            best = t if best is None else min(best, t)
-        if best is None:
-            self.ratio = 0.0
-        else:
-            self.ratio = (me['hp'] / max(1.0, incoming)) / max(0.1, best)
-        self.committed = self.ratio >= (1.0 if self.committed else 1.3)
+        # Standalone callers may omit target; the bot always supplies its choice.
+        if target is None and foes:
+            target = min(foes, key=lambda m: m.get('hp', 1400))
+        tid = target.get('id') if target else None
+        keep = self.committed and tid == self.commit_target
+        self.commit_target = tid
+        self.ratio = 0.0
+        if target and target.get('kind') == 'mech' and len(foes) <= 2 and target in foes:
+            armor = _clamp((me.get('stats') or {}).get('armor', 0), 0, .9)
+            incoming = sum(self.enemy_dps(m, _dist2(me['pos'], m['pos'])) for m in foes)*(1-armor)
+            out = self.my_dps(me, _dist2(me['pos'], target['pos']))
+            if out > 0:
+                self.ratio = (me['hp']/max(1, incoming))/(max(1, target.get('hp', 1400))/out)
+        self.committed = self.ratio >= (1.0 if keep else 1.3)
         return self.ratio
 
     def kill_hp(self, me):
@@ -310,7 +343,7 @@ class Tactics:
                     break
         return hits
 
-    def juke_options(self, obs, target_pos, preferred, speed, accel):
+    def juke_options(self, obs, target_pos, preferred, speed, accel, deadline=float("inf")):
         """Ordered move directions for an exposed fight, best first.
 
         Linear-lead aim assumes our velocity holds until the bullet lands.
@@ -348,7 +381,13 @@ class Tactics:
         if len(projectiles) > 30:  # bound the per-tick cost
             projectiles = sorted(projectiles, key=lambda q: _dist2(pos, q['pos']))[:30]
         if projectiles:
-            danger = [(self._danger(me, o, speed, accel, projectiles), i, o) for i, o in enumerate(opts)]
+            danger = []
+            for i, o in enumerate(opts):
+                if time.perf_counter() >= deadline:
+                    break
+                danger.append((self._danger(me, o, speed, accel, projectiles), i, o))
+            if not danger:
+                return []  # keep the already validated steer action
             danger.sort()
             if danger[0][0] < danger[[d[1] for d in danger].index(0)][0]:
                 best = danger[0][2]
