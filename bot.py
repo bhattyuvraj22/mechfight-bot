@@ -11,7 +11,7 @@ from tactics import Tactics, pick_upgrade
 
 
 class Bot:
-    name='Oval-Sentinel-baseline-simple'
+    name='Oval-Sentinel-isolation'
 
     def __init__(self,hello):
         self.config=hello['config']
@@ -95,7 +95,13 @@ class Bot:
                     -(85 if hp<self.kill_hp else 0)
                     -(40 if self.tactics.recent_attacker(e['id'],self.now) else 0)
                     -(35 if e.get('charging') else 0))
-        target=min(candidates,key=score)['actor']
+        isolated=[t for t in candidates if t['actor']['kind']=='mech' and not any(
+            u['actor']['kind']=='mech' and u['actor']['id']!=t['actor']['id']
+            and u['dist']<200 and (u['exposed'] or distance(u['actor']['pos'],t['actor']['pos'])<65)
+            for u in threats)]
+        pool=isolated or candidates
+        locked=next((t for t in isolated if t['actor']['id']==self.target_id),None)
+        target=(locked or min(pool,key=score))['actor']
         self.target_id=target['id']
         return target
 
@@ -114,7 +120,7 @@ class Bot:
             return None
         others=sum(1 for m in obs['mechs'] if m.get('kind')=='mech' and m['id']!=t['id']
                    and distance(m['pos'],t['pos'])<90)
-        return t if others<=1 else None
+        return t if others==0 else None
 
     def select_upgrade(self,obs):
         offer=obs.get('offer')
@@ -528,17 +534,17 @@ class Bot:
         self.now=now
         self.tactics.note_events(obs)
         self.tactics.observe_shots(obs)
+        self.tactics.evaluate(obs)
         self.combat.observe(obs)
-        self.kill_hp=self.tactics.kill_hp(me)
-        threats=self.threat_list(obs)
-        target=self.choose_target(obs,threats)
-        self.tactics.evaluate(obs,target=target if target is not None else {})
         self.commit=self.tactics.committed
+        self.kill_hp=self.tactics.kill_hp(me)
         hp=me['hp']/max(1,me['max_hp'])
         if hp<0.53 and not self.commit:
             self.healing=True
         elif hp>0.9 or self.commit:
             self.healing=False  # a winning trade is finished, not fled
+        threats=self.threat_list(obs)
+        target=self.choose_target(obs,threats)
         exposed=[t for t in threats if t['exposed']]
         close=[t for t in exposed if t['dist']<115 and t['actor']['kind']=='mech']
         chase=self.chase_target(obs) if target is None else None
@@ -550,9 +556,24 @@ class Bot:
         travel=max(0,distance(pos,z['next_center'])-max(0,z['next_radius']-18))*1.6/max(1,self.stat(me,'walk_speed',11.7))
         urgent=(not me['in_zone'] or self.zone_cost(obs,pos,3)>0 or
                 (travel>0 and z['shrink_end']-now<travel+12))
+        # A brief gun finish is the only exception to disengaging from a group.
+        gun=next((w for w in me['weapons'] if w and w['kind']=='gun'),None)
+        attackers=[t for t in exposed if t['actor']['kind']=='mech' and t['dist']<200]
+        grouped=len(attackers)>=2 or (target is not None and any(
+            t['actor']['kind']=='mech' and t['actor']['id']!=target.get('id')
+            and distance(t['actor']['pos'],target['pos'])<65 for t in threats))
+        burst=0
+        if gun and gun.get('reload',0)<=0 and gun.get('cooldown',0)<=0.1:
+            burst=min(2,gun.get('ammo',0))*gun['stats']['damage']*self.tactics.cube_mult(me.get('cubes',0))
+        quick_finish=(target is not None and target['kind']=='mech' and
+                      target.get('hp',1400)<=burst*0.65 and hp>0.6 and
+                      distance(pos,target['pos'])<65 and len(attackers)<=2)
         if urgent:
             self.mode='ROTATE'
-        elif finish:
+        elif grouped and not quick_finish:
+            self.mode='ESCAPE'
+            self.healing=True
+        elif quick_finish or finish:
             self.mode='FIGHT'
         elif chase is not None and len(close)<2:
             self.mode='CHASE'

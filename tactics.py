@@ -178,7 +178,7 @@ class Tactics:
             total += weapon_dps(kind, s) * hit_prob(kind, dist, s.get('range', 45))
         return total * self.cube_mult(e.get('cubes', 0))
 
-    def evaluate(self, obs, radius=170, target=None):
+    def evaluate(self, obs, radius=170):
         """Survive-time / kill-time ratio against nearby mechs (>1 = we win)."""
         me = obs['self']
         foes = [m for m in obs.get('mechs', []) if m.get('kind') == 'mech'
@@ -190,10 +190,7 @@ class Tactics:
         armor = _clamp((me.get('stats') or {}).get('armor', 0), 0, 0.9)
         incoming = sum(self.enemy_dps(m, _dist2(me['pos'], m['pos'])) for m in foes) * (1 - armor)
         best = None
-        # Incoming damage still includes every nearby enemy. Outgoing damage
-        # must justify fighting the same enemy the combat controller will aim at.
-        targets = foes if target is None else [m for m in foes if m['id'] == target.get('id')]
-        for m in targets:
+        for m in foes:
             d = _dist2(me['pos'], m['pos'])
             out = self.my_dps(me, d)
             if out <= 0:
