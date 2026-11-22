@@ -45,6 +45,7 @@ class Bot:
         self.juking=False
         self.dodging=False
         self.dodge_until=-1
+        self.cover_hold_until=-1
         self.duel_goal=None
 
     def stat(self,me,key,default):
@@ -228,6 +229,16 @@ class Bot:
         thp=target.get('hp',1400)
         if target.get('kind')=='mech' and thp<0.35*target.get('max_hp',1400) and me['hp']>thp:
             preferred=min(preferred,40)
+        if target.get('kind')=='npc':
+            return 58
+        # Preserve our loadout tuning, but do not chase into the opponent's
+        # strongest range when we lack lightning ourselves.
+        if 'lightning' not in kinds:
+            enemy_kinds=target.get('weapons') or []
+            if 'lightning' in enemy_kinds:
+                preferred=max(preferred,64)
+            if 'mortar' in enemy_kinds:
+                preferred=max(preferred,80)
         return preferred
 
     def explore(self,obs,threats):
@@ -352,7 +363,7 @@ class Bot:
             return loot if loot is not None else self.explore(obs,threats)
         if self.mode in ('ESCAPE','HEAL','ROTATE'):
             deadline=min(self.deadline-0.012,time.perf_counter()+0.007)
-            drops=self.drop_points(obs,threats) if self.mode=='HEAL' else []
+            drops=self.drop_points(obs,threats) if self.mode=='HEAL' and obs['t']>=self.cover_hold_until else []
             points=[anchor,tuple(pos[:2])]+drops+self.world.cover_points(pos,radius)
             points.extend((pos[0]+24*math.cos(i*math.pi/4),pos[1]+24*math.sin(i*math.pi/4)) for i in range(8))
             candidates=[]
@@ -616,12 +627,16 @@ class Bot:
                       target.get('hp',1400)<=burst*0.65 and hp>0.6 and
                       distance(pos,target['pos'])<65 and len(attackers)<=2)
         self.duel_goal=None
-        if not urgent and not self.healing and hp>0.6:
+        if not urgent and not self.healing and hp>0.6 and now>=self.cover_hold_until:
             self.duel_goal=self.isolated_position(obs,threats,target)
         if urgent:
             self.mode='ROTATE'
         elif grouped and not quick_finish and self.duel_goal is None:
             self.mode='ESCAPE'
+            self.healing=True
+            self.cover_hold_until=max(self.cover_hold_until,now+2.0)
+        elif now<self.cover_hold_until and not quick_finish:
+            self.mode='ESCAPE' if exposed else 'HEAL'
             self.healing=True
         elif quick_finish or finish or self.duel_goal is not None:
             self.mode='FIGHT'
