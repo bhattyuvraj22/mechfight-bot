@@ -1,3 +1,9 @@
+# Active controller: OvalRunner-derived Go experiment
+
+Docker now runs the attributed Go controller. See [OVALRUNNER_REBUILD.md](OVALRUNNER_REBUILD.md) for provenance, behavior, validation, container commands and rollback. Previous Python strategy documents below describe the inactive controller.
+
+---
+
 # Oval Sentinel — first draft
 
 A Python bot for `mechfight/1`. Target: a practice mean of **6+ placement points**.
