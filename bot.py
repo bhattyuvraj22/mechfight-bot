@@ -45,6 +45,7 @@ class Bot:
         self.juking=False
         self.dodging=False
         self.dodge_until=-1
+        self.duel_goal=None
 
     def stat(self,me,key,default):
         return me['stats'].get(key,self.config['mech'].get(key,default))
@@ -269,6 +270,50 @@ class Bot:
                 value+=weight*(25+max(0,140-d)*0.55)
         return value
 
+    def isolated_position(self,obs,threats,target):
+        """Bounded search for a reachable firing angle with nearby full cover."""
+        if target is None or target.get('kind')!='mech':
+            return None
+        me=obs['self'];pos=me['pos']
+        r,h=self.stat(me,'radius',2.5),self.stat(me,'height',9)
+        muzzle=self.stat(me,'muzzle_height',7)
+        foes=[t['actor'] for t in threats if t['actor']['kind']=='mech' and t['dist']<240]
+        if len(foes)>4:
+            return None
+        end=min(self.deadline-0.012,time.perf_counter()+0.004)
+        points=[tuple(pos[:2])]+[(pos[0]+rad*math.cos(k*math.pi/4),pos[1]+rad*math.sin(k*math.pi/4))
+                               for rad in (7,13) for k in range(8)]
+        best=None
+        for q in points:
+            if time.perf_counter()>end:
+                break
+            if self.zone_cost(obs,q,5)>0 or not self.world.ground_segment(pos,q,r+0.3,h):
+                continue
+            z=self.world.height(*q);body=[*q,z+h*0.6]
+            if not self.world.ray_clear([*q,z+muzzle],center(target)):
+                continue
+            if any(e['id']!=target['id'] and self.world.ray_clear(center(e),body) for e in foes):
+                continue
+            # Require a short reachable exit hidden from every known local mech.
+            escape=False
+            for k in range(8):
+                if time.perf_counter()>end:
+                    break
+                v=(q[0]+6*math.cos(k*math.pi/4),q[1]+6*math.sin(k*math.pi/4))
+                if self.zone_cost(obs,v,6)>0 or not self.world.ground_segment(q,v,r+0.3,h):
+                    continue
+                vz=self.world.height(*v)
+                if all(not self.world.ray_clear(center(e),[*v,vz+h*0.6]) and
+                       not self.world.ray_clear(center(e),[*v,vz+h*0.9]) for e in foes):
+                    escape=True
+                    break
+            if not escape:
+                continue
+            cost=distance(pos,q)+0.25*abs(distance(q,target['pos'])-self.preferred_range(me,target))
+            if best is None or cost<best[0]:
+                best=(cost,q)
+        return best[1] if best else None
+
     def choose_goal(self,obs,threats,target):
         me=obs['self']
         pos=me['pos']
@@ -276,6 +321,8 @@ class Bot:
         height=self.stat(me,'height',9)
         anchor=self.safe_anchor(obs)
         if self.mode=='FIGHT' and target:
+            if self.duel_goal is not None:
+                return self.duel_goal
             loot=self.loot_goal(obs,threats,near_only=True)
             if loot is not None:
                 return loot
@@ -568,12 +615,15 @@ class Bot:
         quick_finish=(target is not None and target['kind']=='mech' and
                       target.get('hp',1400)<=burst*0.65 and hp>0.6 and
                       distance(pos,target['pos'])<65 and len(attackers)<=2)
+        self.duel_goal=None
+        if not urgent and not self.healing and hp>0.6:
+            self.duel_goal=self.isolated_position(obs,threats,target)
         if urgent:
             self.mode='ROTATE'
-        elif grouped and not quick_finish:
+        elif grouped and not quick_finish and self.duel_goal is None:
             self.mode='ESCAPE'
             self.healing=True
-        elif quick_finish or finish:
+        elif quick_finish or finish or self.duel_goal is not None:
             self.mode='FIGHT'
         elif chase is not None and len(close)<2:
             self.mode='CHASE'
@@ -588,7 +638,7 @@ class Bot:
             self.mode='HEAL'
         else:
             self.mode='COLLECT'
-        if (self.goal is None or now-self.goal_at>(0.4 if self.mode=='CHASE' else 0.8)
+        if (self.duel_goal is not None or self.goal is None or now-self.goal_at>(0.4 if self.mode=='CHASE' else 0.8)
                 or self.mode!=self.previous_mode):
             self.goal=self.choose_goal(obs,threats,target)
             self.goal_at=now
@@ -598,7 +648,7 @@ class Bot:
                                    self.stat(me,'max_slope_deg',50),now)
         self.last_waypoint=waypoint
         action=self.steer(obs,waypoint,threats)
-        self.juking=self.juke(obs,target,threats,action)
+        self.juking=self.duel_goal is None and self.juke(obs,target,threats,action)
         self.dodging=self.laser_dodge(obs,action)
         wants_progress=(not self.juking) and (not self.dodging) and distance(pos,self.goal)>6 and distance(pos,waypoint)>1.5
         self.history.append((now,tuple(pos[:2]),float(wants_progress)))
